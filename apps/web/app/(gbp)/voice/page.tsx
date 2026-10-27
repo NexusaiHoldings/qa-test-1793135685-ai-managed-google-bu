@@ -1,4 +1,4 @@
-import { getServerSession } from "@nexus/identity-and-access";
+import { getSessionUser } from "@/lib/admin-auth";
 import { redirect } from "next/navigation";
 import { Pool } from "pg";
 import { calibrateVoiceAction, approveVoiceAction } from "./actions";
@@ -32,9 +32,9 @@ async function getVoiceState(userId: string): Promise<VoiceState | null> {
 }
 
 export default async function VoicePage(): Promise<JSX.Element> {
-  const session = await getServerSession();
-  const userId = session?.user?.id;
-  if (!userId) redirect("/api/auth/signin");
+  const user = await getSessionUser();
+  if (!user) redirect("/login");
+  const userId = user.id;
 
   const state = await getVoiceState(userId);
   if (!state) {
@@ -58,7 +58,12 @@ export default async function VoicePage(): Promise<JSX.Element> {
       </p>
 
       {!profile && (
-        <form action={calibrateVoiceAction}>
+        <form
+          action={async (): Promise<void> => {
+            "use server";
+            await calibrateVoiceAction();
+          }}
+        >
           <button type="submit">Generate voice profile</button>
         </form>
       )}
@@ -70,7 +75,12 @@ export default async function VoicePage(): Promise<JSX.Element> {
             You have fewer than 5 written reviews, so we’ll start with a short preference setup instead of side-by-side
             samples.
           </p>
-          <form action={calibrateVoiceAction}>
+          <form
+            action={async (formData: FormData): Promise<void> => {
+              "use server";
+              await calibrateVoiceAction(formData);
+            }}
+          >
             <label htmlFor="greeting">How do you usually open replies?</label>
             <select id="greeting" name="greeting" defaultValue="thanks">
               <option value="thanks">Simple thanks</option>

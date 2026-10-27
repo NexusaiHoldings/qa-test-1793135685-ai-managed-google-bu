@@ -1,5 +1,4 @@
 import { Pool } from "pg";
-import { z } from "zod";
 
 export type VoiceProfile = {
   greetingStyle: string;
@@ -20,15 +19,39 @@ export type VoiceProfileResult = {
   route: "samples" | "tone-picker";
 };
 
-const voiceProfileSchema = z.object({
-  greetingStyle: z.string().min(1),
-  signOffStyle: z.string().min(1),
-  formality: z.enum(["casual", "balanced", "formal"]),
-  tradeVocabulary: z.array(z.string()).default([]),
-  thingsNeverSaid: z.array(z.string()).default([]),
-  styleRules: z.array(z.string()).default([]),
-  toneSummary: z.string().min(1),
-});
+type ParsedProfile = VoiceProfile & { toneSummary: string };
+
+/** Hand-rolled structured-output validator (no external deps) for the gateway payload. */
+function parseVoiceProfile(value: unknown): ParsedProfile | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+
+  const greetingStyle = typeof v.greetingStyle === "string" ? v.greetingStyle.trim() : "";
+  const signOffStyle = typeof v.signOffStyle === "string" ? v.signOffStyle.trim() : "";
+  const toneSummary = typeof v.toneSummary === "string" ? v.toneSummary.trim() : "";
+  if (!greetingStyle || !signOffStyle || !toneSummary) return null;
+
+  const formality =
+    v.formality === "casual" || v.formality === "balanced" || v.formality === "formal"
+      ? v.formality
+      : null;
+  if (!formality) return null;
+
+  const toStringArray = (input: unknown): string[] =>
+    Array.isArray(input)
+      ? input.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+
+  return {
+    greetingStyle,
+    signOffStyle,
+    formality,
+    tradeVocabulary: toStringArray(v.tradeVocabulary),
+    thingsNeverSaid: toStringArray(v.thingsNeverSaid),
+    styleRules: toStringArray(v.styleRules),
+    toneSummary,
+  };
+}
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -125,10 +148,10 @@ async function buildGatewayProfile(seed: SeedRow[]): Promise<{ profile: VoicePro
 
     if (!response.ok) return fallbackProfile(seed);
     const payload = (await response.json()) as { output?: unknown };
-    const parsed = voiceProfileSchema.safeParse(payload.output);
-    if (!parsed.success) return fallbackProfile(seed);
+    const parsed = parseVoiceProfile(payload.output);
+    if (!parsed) return fallbackProfile(seed);
 
-    const { toneSummary, ...profile } = parsed.data;
+    const { toneSummary, ...profile } = parsed;
     return { profile, toneSummary };
   } catch (error) {
     console.error(
