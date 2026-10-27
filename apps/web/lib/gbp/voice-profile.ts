@@ -1,261 +1,217 @@
 import { Pool } from "pg";
-import { buildVoiceSamples } from "@/lib/gbp/voice-samples";
+import { z } from "zod";
 
-type VoiceSampleState = {
-  index: number;
-  reviewComment: string;
-  currentReply: string;
-  approved: boolean;
-};
-
-type VoiceOnboardingState = {
-  locationId: string;
-  mode: "samples" | "tone-picker";
-  samples: VoiceSampleState[];
-  currentIndex: number;
-  readyToApprove: boolean;
-  isApproved: boolean;
-  successPreview: string;
-};
-
-type TonePickerInput = {
-  userId: string;
-  locationId: string;
+export type VoiceProfile = {
   greetingStyle: string;
-  formality: string;
   signOffStyle: string;
-  neverSay: string;
+  formality: "casual" | "balanced" | "formal";
+  tradeVocabulary: string[];
+  thingsNeverSaid: string[];
+  styleRules: string[];
 };
 
-type SampleFeedbackInput = {
-  userId: string;
+export type VoiceProfileResult = {
   locationId: string;
-  sampleIndex: number;
+  profileId: string;
+  sampleCount: number;
   approved: boolean;
-  editedReply: string;
+  toneSummary: string;
+  profile: VoiceProfile;
+  route: "samples" | "tone-picker";
 };
 
-type ApproveInput = {
-  userId: string;
-  locationId: string;
-};
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+const voiceProfileSchema = z.object({
+  greetingStyle: z.string().min(1),
+  signOffStyle: z.string().min(1),
+  formality: z.enum(["casual", "balanced", "formal"]),
+  tradeVocabulary: z.array(z.string()).default([]),
+  thingsNeverSaid: z.array(z.string()).default([]),
+  styleRules: z.array(z.string()).default([]),
+  toneSummary: z.string().min(1),
 });
 
-async function getPrimaryLocationId(userId: string): Promise<string | null> {
-  const result = await pool.query<{ id: string }>(
-    `
-      SELECT id
-      FROM gbp_locations
-      WHERE user_id = $1
-      ORDER BY linked_at ASC
-      LIMIT 1
-    `,
-    [userId],
-  );
-  return result.rows[0]?.id ?? null;
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+type SeedRow = {
+  location_id: string;
+  title: string | null;
+  primary_category: string | null;
+  website_url: string | null;
+  review_count: number;
+  sample_count: number;
+  reviewer_comment: string | null;
+  owner_reply: string | null;
+};
+
+function fallbackProfile(rows: SeedRow[]): { profile: VoiceProfile; toneSummary: string } {
+  const vocab = new Set<string>();
+  for (const row of rows) {
+    const text = `${row.owner_reply ?? ""} ${row.reviewer_comment ?? ""}`.toLowerCase();
+    for (const token of ["thanks", "appreciate", "team", "service", "quick", "professional", "clean"]) {
+      if (text.includes(token)) vocab.add(token);
+    }
+  }
+  return {
+    toneSummary: "Friendly, concise, and service-focused with clear appreciation for customer feedback.",
+    profile: {
+      greetingStyle: "Start with direct thanks using the reviewer's name when present.",
+      signOffStyle: "Close warmly from the team (no hard sell).",
+      formality: "balanced",
+      tradeVocabulary: Array.from(vocab),
+      thingsNeverSaid: ["guaranteed results", "blame the customer", "legal threats"],
+      styleRules: [
+        "Keep replies under 90 words.",
+        "Acknowledge the specific service context.",
+        "Use plain language an owner-operator would actually say.",
+      ],
+    },
+  };
 }
 
-export async function getVoiceOnboardingState(
-  userId: string,
-  requestedLocationId?: string,
-): Promise<VoiceOnboardingState | null> {
-  const locationId = requestedLocationId ?? (await getPrimaryLocationId(userId));
-  if (!locationId) return null;
+async function buildGatewayProfile(seed: SeedRow[]): Promise<{ profile: VoiceProfile; toneSummary: string }> {
+  const seedText = seed
+    .map((r) =>
+      [
+        `Business: ${r.title ?? "Unknown"}`,
+        `Category: ${r.primary_category ?? "Unknown"}`,
+        `Customer review: ${r.reviewer_comment ?? ""}`,
+        `Owner reply: ${r.owner_reply ?? ""}`,
+      ].join("\n"),
+    )
+    .join("\n\n---\n\n");
 
-  const reviews = await pool.query<{ comment: string }>(
-    `
-      SELECT comment
-      FROM gbp_reviews
-      WHERE location_id = $1
-        AND comment IS NOT NULL
-        AND length(trim(comment)) > 0
-      ORDER BY review_created_at DESC NULLS LAST
-      LIMIT 20
-    `,
-    [locationId],
-  );
-
-  const profileRes = await pool.query<{ profile: Record<string, unknown>; seeded_from_reviews: boolean }>(
-    `
-      SELECT profile, seeded_from_reviews
-      FROM gbp_voice_profiles
-      WHERE location_id = $1
-      LIMIT 1
-    `,
-    [locationId],
-  );
-
-  const profile = profileRes.rows[0]?.profile ?? {};
-  const approved = Boolean((profile as { approved?: boolean }).approved);
-
-  if (approved) {
-    return {
-      locationId,
-      mode: "samples",
-      samples: [],
-      currentIndex: 0,
-      readyToApprove: true,
-      isApproved: true,
-      successPreview:
-        typeof (profile as { firstPostPreview?: unknown }).firstPostPreview === "string"
-          ? ((profile as { firstPostPreview: string }).firstPostPreview ?? "")
-          : "This week we helped another local homeowner get fast, honest service. Thanks for trusting our team.",
-    };
+  const endpoint = process.env.NEXUS_GATEWAY_URL;
+  if (!endpoint) {
+    return fallbackProfile(seed);
   }
 
-  if (reviews.rowCount < 5) {
-    return {
-      locationId,
-      mode: "tone-picker",
-      samples: [],
-      currentIndex: 0,
-      readyToApprove: false,
-      isApproved: false,
-      successPreview: "",
-    };
-  }
+  try {
+    const response = await fetch(`${endpoint}/v1/structured`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${process.env.NEXUS_GATEWAY_API_KEY ?? ""}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-5.4-mini",
+        schema: {
+          type: "object",
+          properties: {
+            greetingStyle: { type: "string" },
+            signOffStyle: { type: "string" },
+            formality: { type: "string", enum: ["casual", "balanced", "formal"] },
+            tradeVocabulary: { type: "array", items: { type: "string" } },
+            thingsNeverSaid: { type: "array", items: { type: "string" } },
+            styleRules: { type: "array", items: { type: "string" } },
+            toneSummary: { type: "string" },
+          },
+          required: [
+            "greetingStyle",
+            "signOffStyle",
+            "formality",
+            "tradeVocabulary",
+            "thingsNeverSaid",
+            "styleRules",
+            "toneSummary",
+          ],
+          additionalProperties: false,
+        },
+        prompt:
+          "Extract the owner's authentic brand voice from historical review/response pairs. Avoid marketing fluff. Output only JSON.",
+        input: seedText,
+      }),
+      cache: "no-store",
+    });
 
-  const samples = await buildVoiceSamples({
-    userId,
+    if (!response.ok) return fallbackProfile(seed);
+    const payload = (await response.json()) as { output?: unknown };
+    const parsed = voiceProfileSchema.safeParse(payload.output);
+    if (!parsed.success) return fallbackProfile(seed);
+
+    const { toneSummary, ...profile } = parsed.data;
+    return { profile, toneSummary };
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        event: "gbp.voice_profile.gateway_failed",
+        message: error instanceof Error ? error.message : "unknown error",
+      }),
+    );
+    return fallbackProfile(seed);
+  }
+}
+
+export async function upsertVoiceProfileForUser(userId: string): Promise<VoiceProfileResult | null> {
+  const seedQuery = `
+    SELECT
+      l.id AS location_id,
+      l.title,
+      l.primary_category,
+      l.website_url,
+      COALESCE(l.review_count, 0) AS review_count,
+      (
+        SELECT COUNT(*)
+        FROM gbp_reviews r2
+        WHERE r2.location_id = l.id
+          AND COALESCE(NULLIF(TRIM(r2.comment), ''), '') <> ''
+      )::int AS sample_count,
+      r.comment AS reviewer_comment,
+      COALESCE(rr.comment, r.reply_comment) AS owner_reply
+    FROM gbp_locations l
+    LEFT JOIN gbp_reviews r ON r.location_id = l.id
+    LEFT JOIN gbp_review_responses rr ON rr.review_id = r.id
+    WHERE l.user_id = $1
+    ORDER BY l.linked_at ASC, r.review_created_at DESC
+    LIMIT 60
+  `;
+  const seedRes = await pool.query<SeedRow>(seedQuery, [userId]);
+  if (seedRes.rowCount === 0) return null;
+
+  const locationId = seedRes.rows[0].location_id;
+  const rowsForLocation = seedRes.rows.filter((r) => r.location_id === locationId);
+  const sampleCount = rowsForLocation[0]?.sample_count ?? 0;
+  const route: "samples" | "tone-picker" = sampleCount >= 5 ? "samples" : "tone-picker";
+
+  const { profile, toneSummary } = await buildGatewayProfile(rowsForLocation);
+
+  const upsert = `
+    INSERT INTO gbp_voice_profiles (
+      location_id,
+      user_id,
+      sample_count,
+      tone_summary,
+      profile,
+      seeded_from_reviews,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5::jsonb, $6, now())
+    ON CONFLICT (location_id)
+    DO UPDATE SET
+      user_id = EXCLUDED.user_id,
+      sample_count = EXCLUDED.sample_count,
+      tone_summary = EXCLUDED.tone_summary,
+      profile = EXCLUDED.profile,
+      seeded_from_reviews = EXCLUDED.seeded_from_reviews,
+      updated_at = now()
+    RETURNING id, approved
+  `;
+  const upsertRes = await pool.query<{ id: string; approved: boolean }>(upsert, [
     locationId,
-    reviews: reviews.rows.map((r) => r.comment).filter(Boolean),
-  });
+    userId,
+    sampleCount,
+    toneSummary,
+    JSON.stringify(profile),
+    sampleCount >= 1,
+  ]);
 
-  const sampleState: VoiceSampleState[] = samples.map((s, idx) => ({
-    index: idx,
-    reviewComment: s.reviewComment,
-    currentReply: s.currentReply,
-    approved: s.approved,
-  }));
-
-  const currentIndex = sampleState.findIndex((s) => !s.approved);
   return {
     locationId,
-    mode: "samples",
-    samples: sampleState,
-    currentIndex: currentIndex === -1 ? sampleState.length - 1 : currentIndex,
-    readyToApprove: sampleState.every((s) => s.approved),
-    isApproved: false,
-    successPreview: "",
+    profileId: upsertRes.rows[0].id,
+    sampleCount,
+    approved: upsertRes.rows[0].approved,
+    toneSummary,
+    profile,
+    route,
   };
-}
-
-export async function saveTonePickerProfile(input: TonePickerInput): Promise<void> {
-  const profile = {
-    greetingStyle: input.greetingStyle,
-    formality: input.formality,
-    signOffStyle: input.signOffStyle,
-    neverSay: input.neverSay ? input.neverSay.split(",").map((v) => v.trim()).filter(Boolean) : [],
-    approved: false,
-    source: "tone_picker",
-  };
-
-  await pool.query(
-    `
-      INSERT INTO gbp_voice_profiles (location_id, user_id, sample_count, tone_summary, profile, seeded_from_reviews, updated_at)
-      VALUES ($1, $2, 0, $3, $4::jsonb, false, now())
-      ON CONFLICT (location_id)
-      DO UPDATE SET
-        user_id = EXCLUDED.user_id,
-        sample_count = 0,
-        tone_summary = EXCLUDED.tone_summary,
-        profile = EXCLUDED.profile,
-        seeded_from_reviews = false,
-        updated_at = now()
-    `,
-    [
-      input.locationId,
-      input.userId,
-      `${input.formality} with ${input.greetingStyle} greeting and ${input.signOffStyle} sign-off`,
-      JSON.stringify(profile),
-    ],
-  );
-}
-
-export async function saveVoiceSampleFeedback(input: SampleFeedbackInput): Promise<void> {
-  const state = await getVoiceOnboardingState(input.userId, input.locationId);
-  if (!state || state.mode !== "samples") {
-    throw new Error("Voice samples are unavailable.");
-  }
-
-  const sample = state.samples[input.sampleIndex];
-  if (!sample) {
-    throw new Error("Sample index out of range.");
-  }
-
-  const updatedSamples = state.samples.map((s) =>
-    s.index === input.sampleIndex
-      ? {
-          ...s,
-          currentReply: input.editedReply || s.currentReply,
-          approved: input.approved,
-        }
-      : s,
-  );
-
-  const existing = await pool.query<{ profile: Record<string, unknown> }>(
-    `SELECT profile FROM gbp_voice_profiles WHERE location_id = $1 LIMIT 1`,
-    [input.locationId],
-  );
-
-  const merged = {
-    ...(existing.rows[0]?.profile ?? {}),
-    approved: false,
-    samplePairs: updatedSamples,
-  };
-
-  await pool.query(
-    `
-      INSERT INTO gbp_voice_profiles (location_id, user_id, sample_count, tone_summary, profile, seeded_from_reviews, updated_at)
-      VALUES ($1, $2, $3, $4, $5::jsonb, true, now())
-      ON CONFLICT (location_id)
-      DO UPDATE SET
-        user_id = EXCLUDED.user_id,
-        sample_count = EXCLUDED.sample_count,
-        tone_summary = EXCLUDED.tone_summary,
-        profile = EXCLUDED.profile,
-        seeded_from_reviews = true,
-        updated_at = now()
-    `,
-    [
-      input.locationId,
-      input.userId,
-      updatedSamples.length,
-      "Owner-calibrated from review sample approvals",
-      JSON.stringify(merged),
-    ],
-  );
-}
-
-export async function approveVoiceProfile(input: ApproveInput): Promise<void> {
-  const existing = await pool.query<{ profile: Record<string, unknown> }>(
-    `SELECT profile FROM gbp_voice_profiles WHERE location_id = $1 LIMIT 1`,
-    [input.locationId],
-  );
-
-  const merged = {
-    ...(existing.rows[0]?.profile ?? {}),
-    approved: true,
-    approvedAt: new Date().toISOString(),
-    firstPostPreview:
-      "Thanks for supporting our local business. This week we're sharing a recent job highlight and practical tips to keep your home running smoothly.",
-  };
-
-  await pool.query(
-    `
-      INSERT INTO gbp_voice_profiles (location_id, user_id, sample_count, tone_summary, profile, seeded_from_reviews, updated_at)
-      VALUES ($1, $2, 3, $3, $4::jsonb, true, now())
-      ON CONFLICT (location_id)
-      DO UPDATE SET
-        user_id = EXCLUDED.user_id,
-        profile = EXCLUDED.profile,
-        tone_summary = EXCLUDED.tone_summary,
-        seeded_from_reviews = true,
-        updated_at = now()
-    `,
-    [input.locationId, input.userId, "Approved voice profile", JSON.stringify(merged)],
-  );
 }

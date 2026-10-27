@@ -1,50 +1,46 @@
-export type GeneratedSample = {
-  reviewComment: string;
-  currentReply: string;
-  approved: boolean;
+import { Pool } from "pg";
+
+export type VoiceSample = {
+  reviewId: string;
+  reviewText: string;
+  draftedReply: string;
+  reviewerName: string | null;
+  starRating: number | null;
 };
 
-type BuildVoiceSamplesInput = {
-  userId: string;
-  locationId: string;
-  reviews: string[];
-};
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-function draftReplyFromReview(review: string): string {
-  const trimmed = review.trim();
-  if (trimmed.length === 0) {
-    return "Thank you for your feedback—we appreciate you choosing us.";
-  }
-
-  const lower = trimmed.toLowerCase();
-  const mentionsFast = lower.includes("fast") || lower.includes("quick");
-  const mentionsClean = lower.includes("clean");
-  const mentionsTeam = lower.includes("team") || lower.includes("staff");
-
-  const parts: string[] = ["Thank you for the kind words"];
-  if (mentionsTeam) parts.push("about our team");
-  parts[0] = `${parts[0]}${parts.length > 1 ? ` ${parts[1]}` : ""}.`;
-
-  if (mentionsFast) {
-    parts.push("We know how important quick turnaround is and we’re glad we delivered.");
-  }
-  if (mentionsClean) {
-    parts.push("Keeping the work area clean and respectful is a core part of how we operate.");
-  }
-
-  parts.push("We appreciate your trust and look forward to helping again whenever you need us.");
-  return parts.join(" ");
+function draftReply(reviewText: string, reviewerName: string | null): string {
+  const opener = reviewerName ? `Thanks ${reviewerName},` : "Thanks so much,";
+  const summary = reviewText.length > 180 ? `${reviewText.slice(0, 177)}...` : reviewText;
+  return `${opener} we really appreciate you taking the time to share this. ${summary ? "Glad our team could help." : "Your feedback means a lot to us."} If you ever need us again, we’re here for you.`;
 }
 
-export async function buildVoiceSamples(input: BuildVoiceSamplesInput): Promise<GeneratedSample[]> {
-  const selected = input.reviews.slice(0, 3);
-  while (selected.length < 3) {
-    selected.push("Great service and friendly team.");
-  }
+export async function getVoiceSamples(locationId: string): Promise<VoiceSample[]> {
+  const query = `
+    SELECT
+      id AS review_id,
+      COALESCE(NULLIF(TRIM(comment), ''), '') AS review_text,
+      reviewer_name,
+      star_rating
+    FROM gbp_reviews
+    WHERE location_id = $1
+      AND COALESCE(NULLIF(TRIM(comment), ''), '') <> ''
+    ORDER BY review_created_at DESC NULLS LAST
+    LIMIT 3
+  `;
+  const result = await pool.query<{
+    review_id: string;
+    review_text: string;
+    reviewer_name: string | null;
+    star_rating: number | null;
+  }>(query, [locationId]);
 
-  return selected.map((review) => ({
-    reviewComment: review,
-    currentReply: draftReplyFromReview(review),
-    approved: false,
+  return result.rows.map((row) => ({
+    reviewId: row.review_id,
+    reviewText: row.review_text,
+    draftedReply: draftReply(row.review_text, row.reviewer_name),
+    reviewerName: row.reviewer_name,
+    starRating: row.star_rating,
   }));
 }

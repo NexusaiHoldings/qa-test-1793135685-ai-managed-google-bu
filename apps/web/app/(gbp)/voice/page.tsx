@@ -1,138 +1,165 @@
 import { getServerSession } from "@nexus/identity-and-access";
 import { redirect } from "next/navigation";
-import {
-  finalizeVoiceApprovalAction,
-  saveSampleFeedbackAction,
-  submitTonePickerAction,
-} from "./actions";
-import { getVoiceOnboardingState } from "@/lib/gbp/voice-profile";
+import { Pool } from "pg";
+import { calibrateVoiceAction, approveVoiceAction } from "./actions";
+import { upsertVoiceProfileForUser } from "@/lib/gbp/voice-profile";
+import { getVoiceSamples } from "@/lib/gbp/voice-samples";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+type VoiceState = {
+  locationId: string;
+  approved: boolean;
+  title: string | null;
+};
+
+async function getVoiceState(userId: string): Promise<VoiceState | null> {
+  const query = `
+    SELECT l.id AS location_id, l.title, COALESCE(vp.approved, false) AS approved
+    FROM gbp_locations l
+    LEFT JOIN gbp_voice_profiles vp ON vp.location_id = l.id
+    WHERE l.user_id = $1
+    ORDER BY l.linked_at ASC
+    LIMIT 1
+  `;
+  const res = await pool.query<{ location_id: string; title: string | null; approved: boolean }>(query, [userId]);
+  if (res.rowCount === 0) return null;
+  return {
+    locationId: res.rows[0].location_id,
+    approved: res.rows[0].approved,
+    title: res.rows[0].title,
+  };
+}
 
 export default async function VoicePage(): Promise<JSX.Element> {
   const session = await getServerSession();
   const userId = session?.user?.id;
+  if (!userId) redirect("/api/auth/signin");
 
-  if (!userId) {
-    redirect("/api/auth/signin");
-  }
-
-  const state = await getVoiceOnboardingState(userId);
-
+  const state = await getVoiceState(userId);
   if (!state) {
     return (
       <main>
-        <h1>Brand voice calibration</h1>
-        <p>Connect a Google Business Profile location first to calibrate your voice.</p>
-        <div className="empty">No location is linked yet.</div>
+        <h1>Voice calibration</h1>
+        <p>Connect a Google Business Profile location first, then we’ll calibrate your reply voice.</p>
+        <div className="empty">No location connected yet.</div>
       </main>
     );
   }
 
-  if (state.isApproved) {
-    return (
-      <main>
-        <h1>Brand voice calibration</h1>
-        <p>Your voice profile is approved. Automated drafting can now stay in your tone.</p>
-        <section className="card">
-          <h2>You're all set ✅</h2>
-          <p className="muted">Preview of your first weekly post:</p>
-          <p style={{ lineHeight: 1.7 }}>{state.successPreview}</p>
-        </section>
-      </main>
-    );
-  }
-
-  if (state.mode === "tone-picker") {
-    return (
-      <main>
-        <h1>Brand voice calibration</h1>
-        <p>Quick tone picker (fewer than 5 reviews found). This takes about 60 seconds.</p>
-
-        <form action={submitTonePickerAction} className="card">
-          <input type="hidden" name="locationId" value={state.locationId} />
-
-          <label htmlFor="greetingStyle">How should replies open?</label>
-          <select id="greetingStyle" name="greetingStyle" defaultValue="warm">
-            <option value="warm">Warm and thankful</option>
-            <option value="direct">Direct and brief</option>
-            <option value="neighborly">Neighborly/local</option>
-          </select>
-
-          <label htmlFor="formality">Overall tone</label>
-          <select id="formality" name="formality" defaultValue="professional">
-            <option value="casual">Casual</option>
-            <option value="professional">Professional</option>
-            <option value="formal">Formal</option>
-          </select>
-
-          <label htmlFor="signOffStyle">How should replies close?</label>
-          <select id="signOffStyle" name="signOffStyle" defaultValue="team-name">
-            <option value="team-name">Signed with team name</option>
-            <option value="owner-name">Signed with owner name</option>
-            <option value="none">No sign-off</option>
-          </select>
-
-          <label htmlFor="neverSay">Anything we should never say?</label>
-          <input id="neverSay" name="neverSay" placeholder='e.g. "cheap", "guaranteed same-day"' />
-
-          <button type="submit">Save my tone profile</button>
-        </form>
-      </main>
-    );
-  }
-
-  const current = state.samples[state.currentIndex];
-  const currentProgress = `${state.currentIndex + 1} of ${state.samples.length}`;
+  const profile = await upsertVoiceProfileForUser(userId);
+  const samples = await getVoiceSamples(state.locationId);
 
   return (
     <main>
-      <h1>Brand voice calibration</h1>
-      <p>Compare each real review with our drafted reply. Approve or edit all 3 before automation starts.</p>
+      <h1>Voice calibration</h1>
+      <p>
+        We build your reply style from your real reviews and past language first. Nothing automates until you approve it.
+      </p>
 
-      <p className="muted">Progress: {currentProgress}</p>
+      {!profile && (
+        <form action={calibrateVoiceAction}>
+          <button type="submit">Generate voice profile</button>
+        </form>
+      )}
 
-      <section className="card">
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr",
-            gap: "0.75rem",
-          }}
-        >
-          <div className="card" style={{ background: "var(--surface-muted, #f6f6f6)" }}>
-            <h3>Past customer review</h3>
-            <p style={{ lineHeight: 1.8 }}>{current.reviewComment}</p>
-          </div>
+      {profile && profile.route === "tone-picker" && (
+        <section className="card">
+          <h2>Quick tone picker</h2>
+          <p className="muted">
+            You have fewer than 5 written reviews, so we’ll start with a short preference setup instead of side-by-side
+            samples.
+          </p>
+          <form action={calibrateVoiceAction}>
+            <label htmlFor="greeting">How do you usually open replies?</label>
+            <select id="greeting" name="greeting" defaultValue="thanks">
+              <option value="thanks">Simple thanks</option>
+              <option value="name">Use customer name + thanks</option>
+              <option value="direct">Direct and brief</option>
+            </select>
 
-          <div className="card" style={{ boxShadow: "0 2px 10px rgba(0,0,0,0.06)" }}>
-            <h3>Drafted reply in your voice</h3>
-            <form action={saveSampleFeedbackAction}>
-              <input type="hidden" name="locationId" value={state.locationId} />
-              <input type="hidden" name="sampleIndex" value={String(current.index)} />
-              <textarea
-                name="editedReply"
-                defaultValue={current.currentReply}
-                rows={7}
-                style={{ lineHeight: 1.8 }}
-              />
-              <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
-                <button type="submit" name="approved" value="true">
-                  Sounds like me
-                </button>
-                <button type="submit" name="approved" value="false">
-                  Save edit
-                </button>
-              </div>
+            <label htmlFor="formality">Formality</label>
+            <select id="formality" name="formality" defaultValue="balanced">
+              <option value="casual">Casual</option>
+              <option value="balanced">Balanced</option>
+              <option value="formal">Formal</option>
+            </select>
+
+            <label htmlFor="signoff">Sign-off style</label>
+            <select id="signoff" name="signoff" defaultValue="team">
+              <option value="team">From the team</option>
+              <option value="owner">Owner first-name sign-off</option>
+              <option value="none">No sign-off</option>
+            </select>
+
+            <label htmlFor="never">Anything you never want to say</label>
+            <input id="never" name="never" placeholder="e.g. guaranteed results, salesy language" />
+
+            <button type="submit">Save tone and continue</button>
+          </form>
+        </section>
+      )}
+
+      {profile && profile.route === "samples" && (
+        <section>
+          <p className="muted">
+            {state.title ? `${state.title} · ` : ""}
+            {profile.sampleCount} review samples found
+          </p>
+
+          {samples.length === 0 ? (
+            <div className="empty">No written reviews yet. Add at least one review comment to preview voice matching.</div>
+          ) : (
+            <ol style={{ listStyle: "none", padding: 0, margin: 0 }}>
+              {samples.map((sample, idx) => (
+                <li key={sample.reviewId} className="card" style={{ marginBottom: "1rem" }}>
+                  <p className="muted">Progress: {idx + 1} of {samples.length}</p>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "1fr",
+                      gap: "0.75rem",
+                    }}
+                  >
+                    <div className="card" style={{ background: "var(--muted-bg, rgba(127,127,127,0.08))" }}>
+                      <h3>Real review</h3>
+                      <p style={{ lineHeight: 1.7 }}>{sample.reviewText}</p>
+                    </div>
+                    <div className="card" style={{ boxShadow: "0 2px 10px rgba(0,0,0,0.08)" }}>
+                      <h3>Drafted reply</h3>
+                      <p style={{ lineHeight: 1.7 }}>{sample.draftedReply}</p>
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          )}
+
+          {!state.approved ? (
+            <form
+              action={async (): Promise<void> => {
+                "use server";
+                await approveVoiceAction(state.locationId);
+              }}
+            >
+              <button type="submit">Sounds like me</button>
             </form>
-          </div>
-        </div>
-      </section>
-
-      <form action={finalizeVoiceApprovalAction}>
-        <input type="hidden" name="locationId" value={state.locationId} />
-        <button type="submit" disabled={!state.readyToApprove}>
-          Approve voice profile & enable automation
-        </button>
-      </form>
+          ) : (
+            <section className="card">
+              <h2>Voice approved ✅</h2>
+              <p className="muted">
+                Great — automation can now use this voice profile. Here’s a preview of your first weekly post tone:
+              </p>
+              <div className="card">
+                <p>
+                  Quick update from our team: this week we wrapped several local jobs and had great feedback on fast,
+                  clean service. If you need help with your next project, we’re here and ready to help.
+                </p>
+              </div>
+            </section>
+          )}
+        </section>
+      )}
     </main>
   );
 }

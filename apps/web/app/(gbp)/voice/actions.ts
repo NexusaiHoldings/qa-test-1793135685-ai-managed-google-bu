@@ -1,104 +1,38 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
+import { Pool } from "pg";
 import { getServerSession } from "@nexus/identity-and-access";
-import {
-  approveVoiceProfile,
-  getVoiceOnboardingState,
-  saveTonePickerProfile,
-  saveVoiceSampleFeedback,
-} from "@/lib/gbp/voice-profile";
+import { upsertVoiceProfileForUser } from "@/lib/gbp/voice-profile";
 
-function getString(formData: FormData, key: string): string {
-  const value: FormDataEntryValue | null = formData.get(key);
-  return typeof value === "string" ? value.trim() : "";
-}
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-export async function submitTonePickerAction(formData: FormData): Promise<void> {
+export async function calibrateVoiceAction(): Promise<{ ok: boolean; reason?: string }> {
   const session = await getServerSession();
   const userId = session?.user?.id;
+  if (!userId) return { ok: false, reason: "unauthorized" };
 
-  if (!userId) {
-    redirect("/api/auth/signin");
-  }
-
-  const locationId = getString(formData, "locationId");
-  const greetingStyle = getString(formData, "greetingStyle");
-  const formality = getString(formData, "formality");
-  const signOffStyle = getString(formData, "signOffStyle");
-  const neverSay = getString(formData, "neverSay");
-
-  if (!locationId || !greetingStyle || !formality || !signOffStyle) {
-    throw new Error("Missing required tone picker fields.");
-  }
-
-  await saveTonePickerProfile({
-    userId,
-    locationId,
-    greetingStyle,
-    formality,
-    signOffStyle,
-    neverSay,
-  });
-
-  revalidatePath("/voice");
+  const result = await upsertVoiceProfileForUser(userId);
+  if (!result) return { ok: false, reason: "no_location" };
+  return { ok: true };
 }
 
-export async function saveSampleFeedbackAction(formData: FormData): Promise<void> {
+export async function approveVoiceAction(locationId: string): Promise<{ ok: boolean; reason?: string }> {
   const session = await getServerSession();
   const userId = session?.user?.id;
+  if (!userId) return { ok: false, reason: "unauthorized" };
 
-  if (!userId) {
-    redirect("/api/auth/signin");
-  }
-
-  const locationId = getString(formData, "locationId");
-  const sampleIndex = Number(getString(formData, "sampleIndex"));
-  const approved = getString(formData, "approved") === "true";
-  const editedReply = getString(formData, "editedReply");
-
-  if (!locationId || Number.isNaN(sampleIndex) || sampleIndex < 0) {
-    throw new Error("Invalid sample feedback payload.");
-  }
-
-  await saveVoiceSampleFeedback({
-    userId,
-    locationId,
-    sampleIndex,
-    approved,
-    editedReply,
-  });
-
-  revalidatePath("/voice");
-}
-
-export async function finalizeVoiceApprovalAction(formData: FormData): Promise<void> {
-  const session = await getServerSession();
-  const userId = session?.user?.id;
-
-  if (!userId) {
-    redirect("/api/auth/signin");
-  }
-
-  const locationId = getString(formData, "locationId");
-  if (!locationId) {
-    throw new Error("Missing location for approval.");
-  }
-
-  const state = await getVoiceOnboardingState(userId, locationId);
-  if (!state) {
-    throw new Error("Unable to load voice state.");
-  }
-
-  if (!state.readyToApprove) {
-    throw new Error("Please complete all 3 samples before approval.");
-  }
-
-  await approveVoiceProfile({
-    userId,
-    locationId,
-  });
-
-  revalidatePath("/voice");
+  const query = `
+    UPDATE gbp_voice_profiles vp
+    SET approved = true,
+        approved_at = now(),
+        updated_at = now()
+    FROM gbp_locations l
+    WHERE vp.location_id = $1
+      AND vp.location_id = l.id
+      AND l.user_id = $2
+    RETURNING vp.id
+  `;
+  const res = await pool.query<{ id: string }>(query, [locationId, userId]);
+  if (res.rowCount === 0) return { ok: false, reason: "not_found" };
+  return { ok: true };
 }
