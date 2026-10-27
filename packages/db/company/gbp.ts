@@ -262,10 +262,6 @@ CREATE TABLE IF NOT EXISTS gbp_notification_watches (
 CREATE INDEX IF NOT EXISTS idx_gbp_notification_watches_location ON gbp_notification_watches (location_id);
 
 -- ── Review Response Engine additions (Feature F1-005) ──────────────────────────
--- The core value loop: a synced review is risk-classified, drafted in-voice,
--- claims-guarded, then either auto-published, routed to the owner to approve, or
--- escalated to the team. The tier + draft + publish status live on gbp_reviews so
--- the owner's /reviews feed can render a status pill without extra joins.
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS risk_tier         text;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS risk_reasons      jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS classified_at     timestamptz;
@@ -273,22 +269,51 @@ ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_reply       text;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_response_id uuid;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_generated_at timestamptz;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_model       text;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS claims_verdict    text;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS claims_findings   jsonb NOT NULL DEFAULT '[]'::jsonb;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS route_status      text NOT NULL DEFAULT 'pending';
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS route_reason      text;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS published_response_id uuid;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approval_status   text NOT NULL DEFAULT 'pending';
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approved_at       timestamptz;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS published_at      timestamptz;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS failed_at         timestamptz;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS failure_reason    text;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS escalated         boolean NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS idx_gbp_reviews_approval_status ON gbp_reviews (location_id, approval_status, review_created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_gbp_reviews_route_status
-  ON gbp_reviews (location_id, route_status, review_created_at DESC);
+-- ── Operator Escalation Queue additions (Feature F1-010) ──────────────────────
+CREATE TABLE IF NOT EXISTS gbp_escalations (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  review_id          uuid,
+  location_id        uuid NOT NULL,
+  severity           text NOT NULL DEFAULT 'medium',
+  category           text NOT NULL DEFAULT 'sensitive',
+  agent_rationale    text,
+  drafted_reply      text,
+  edited_reply       text,
+  action             text NOT NULL DEFAULT 'open',
+  action_taken_by    uuid,
+  action_note        text,
+  action_taken_at    timestamptz,
+  dismissed_reason   text,
+  token_cost_input   integer NOT NULL DEFAULT 0,
+  token_cost_output  integer NOT NULL DEFAULT 0,
+  provider_spend_usd numeric(12,4) NOT NULL DEFAULT 0,
+  quota_units        integer NOT NULL DEFAULT 0,
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  updated_at         timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_gbp_escalations_location_status ON gbp_escalations (location_id, action, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gbp_escalations_review ON gbp_escalations (review_id);
 
--- ── F1-008 rank tracking polish ──────────────────────────────────────────────────
-ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS city text;
-ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS snapshot_date date;
-ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS provider_status text NOT NULL DEFAULT 'ok';
-CREATE INDEX IF NOT EXISTS idx_gbp_rank_snapshots_keyword_date
-  ON gbp_rank_snapshots (keyword_id, captured_at DESC);
+CREATE TABLE IF NOT EXISTS gbp_automation_pauses (
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  scope            text NOT NULL DEFAULT 'location',
+  location_id      uuid,
+  is_paused        boolean NOT NULL DEFAULT false,
+  reason           text,
+  paused_by        uuid,
+  paused_at        timestamptz,
+  resume_at        timestamptz,
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT gbp_automation_pauses_unique_scope UNIQUE (scope, location_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gbp_automation_pauses_scope ON gbp_automation_pauses (scope, is_paused);
+
+CREATE INDEX IF NOT EXISTS idx_gbp_api_health_location_created
+  ON gbp_api_health_events (location_id, created_at DESC);
 `;
