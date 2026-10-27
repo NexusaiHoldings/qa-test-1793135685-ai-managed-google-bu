@@ -1,133 +1,145 @@
-import { query } from "@repo/db";
-import { runClaimsRules, type ClaimsRuleMatch, type GbpContentKind } from "@/lib/gbp/claims-rules";
+import { sql } from "@repo/db";
+import {
+  ClaimsContentKind,
+  FlaggedClaim,
+  detectFlaggedClaims,
+  getClaimsRulesForState,
+} from "@/lib/gbp/claims-rules";
 
-export type ClaimsGuardVerdict = "pass" | "rewrite_required" | "blocked";
+export type ClaimsVerdict = "pass" | "blocked";
 
 export interface ClaimsGuardInput {
   locationId: string;
-  contentKind: GbpContentKind;
-  contentRef: string;
-  text: string;
+  contentKind: ClaimsContentKind;
+  contentRef: string | null;
+  originalText: string;
   competitorNames?: string[];
 }
 
 export interface ClaimsGuardResult {
-  verdict: ClaimsGuardVerdict;
-  strippedClaims: ClaimsRuleMatch[];
+  verdict: ClaimsVerdict;
+  strippedClaims: FlaggedClaim[];
   rewrittenText: string;
-  checkId: string;
+  contentCheckId: string;
 }
 
-interface LocationStateRow {
-  state: string | null;
+interface RewriterResponse {
+  rewrittenText: string;
 }
 
-interface CheckInsertRow {
-  id: string;
-}
+function sanitizeTextByRemovingFindings(text: string, findings: FlaggedClaim[]): string {
+  if (findings.length === 0) return text.trim();
 
-function scrubByRules(text: string, matches: ClaimsRuleMatch[]): string {
-  if (matches.length === 0) return text.trim();
+  const sorted = [...findings].sort((a, b) => a.start - b.start);
+  let cursor = 0;
+  let output = "";
 
-  let rewritten = text;
-  const ordered = [...matches].sort((a, b) => b.start - a.start);
-  for (const match of ordered) {
-    rewritten = `${rewritten.slice(0, match.start)} ${rewritten.slice(match.end)}`;
+  for (const finding of sorted) {
+    const start = Math.max(0, finding.start);
+    const end = Math.min(text.length, finding.end);
+    if (end <= cursor) continue;
+    if (start > cursor) {
+      output += text.slice(cursor, start);
+    }
+    cursor = end;
   }
 
-  return rewritten.replace(/\s+/g, " ").replace(/\s([,.!?;:])/g, "$1").trim();
+  if (cursor < text.length) {
+    output += text.slice(cursor);
+  }
+
+  return output
+    .replace(/\s{2,}/g, " ")
+    .replace(/\s+([,.!?;:])/g, "$1")
+    .trim();
+}
+
+async function gatewayRewrite(
+  originalText: string,
+  findings: FlaggedClaim[],
+): Promise<RewriterResponse> {
+  const deterministic = sanitizeTextByRemovingFindings(originalText, findings);
+  return { rewrittenText: deterministic };
 }
 
 async function getLocationState(locationId: string): Promise<string | null> {
-  const rows = await query<LocationStateRow>(
-    `
-      SELECT (storefront_address ->> 'regionCode') AS state
-      FROM gbp_locations
-      WHERE id = $1
-      LIMIT 1
-    `,
-    [locationId],
-  );
+  const rows = await sql<{ storefront_address: unknown; service_areas: unknown }[]>`
+    SELECT storefront_address, service_areas
+    FROM gbp_locations
+    WHERE id = ${locationId}::uuid
+    LIMIT 1
+  `;
 
-  if (rows.length === 0) {
-    throw new Error("GBP location not found for claims guard.");
+  const row = rows[0];
+  if (!row) return null;
+
+  const address = (row.storefront_address as Record<string, unknown> | null) ?? null;
+  if (address && typeof address.administrativeArea === "string") {
+    return address.administrativeArea;
   }
 
-  return rows[0]?.state ?? null;
-}
+  const serviceAreas = Array.isArray(row.service_areas) ? row.service_areas : [];
+  for (const item of serviceAreas) {
+    if (item && typeof item === "object" && "regionCode" in item) {
+      const regionCode = (item as Record<string, unknown>).regionCode;
+      if (typeof regionCode === "string" && regionCode.trim()) return regionCode;
+    }
+  }
 
-async function rewriteThroughGateway(
-  originalText: string,
-  strippedClaims: ClaimsRuleMatch[],
-): Promise<string> {
-  const deterministic = scrubByRules(originalText, strippedClaims);
-  return deterministic;
-}
-
-async function insertContentCheck(params: {
-  locationId: string;
-  contentKind: GbpContentKind;
-  contentRef: string;
-  verdict: ClaimsGuardVerdict;
-  strippedClaims: ClaimsRuleMatch[];
-  rewrittenText: string;
-}): Promise<string> {
-  const rows = await query<CheckInsertRow>(
-    `
-      INSERT INTO gbp_content_checks (
-        location_id,
-        content_kind,
-        content_ref,
-        verdict,
-        stripped_claims,
-        rewritten_text
-      )
-      VALUES ($1, $2, $3::uuid, $4, $5::jsonb, $6)
-      RETURNING id
-    `,
-    [
-      params.locationId,
-      params.contentKind,
-      params.contentRef,
-      params.verdict,
-      JSON.stringify(params.strippedClaims),
-      params.rewrittenText,
-    ],
-  );
-
-  return rows[0]?.id ?? "";
+  return null;
 }
 
 export async function runClaimsGuard(input: ClaimsGuardInput): Promise<ClaimsGuardResult> {
   const state = await getLocationState(input.locationId);
-  const strippedClaims = runClaimsRules({
-    text: input.text,
-    state,
-    contentKind: input.contentKind,
-    competitorNames: input.competitorNames,
-  });
+  const rules = getClaimsRulesForState(state);
+  const strippedClaims = detectFlaggedClaims(
+    input.originalText,
+    rules,
+    input.competitorNames ?? [],
+  );
 
-  const hasHighSeverity = strippedClaims.some((m) => m.severity === "high");
-  const rewrittenText = await rewriteThroughGateway(input.text, strippedClaims);
+  const rewritten = await gatewayRewrite(input.originalText, strippedClaims);
+  const hasResidualFindings = detectFlaggedClaims(
+    rewritten.rewrittenText,
+    rules,
+    input.competitorNames ?? [],
+  ).length > 0;
 
-  let verdict: ClaimsGuardVerdict = "pass";
-  if (strippedClaims.length > 0) {
-    verdict = hasHighSeverity ? "blocked" : "rewrite_required";
-  }
+  const verdict: ClaimsVerdict =
+    strippedClaims.length === 0 || (!hasResidualFindings && rewritten.rewrittenText.length > 0)
+      ? "pass"
+      : "blocked";
 
-  const checkId = await insertContentCheck({
-    locationId: input.locationId,
-    contentKind: input.contentKind,
-    contentRef: input.contentRef,
-    verdict,
-    strippedClaims,
-    rewrittenText,
-  });
+  const inserted = await sql<{ id: string }[]>`
+    INSERT INTO gbp_content_checks (
+      location_id,
+      subject_type,
+      subject_id,
+      verdict,
+      findings,
+      content_kind,
+      content_ref,
+      stripped_claims,
+      rewritten_text
+    )
+    VALUES (
+      ${input.locationId}::uuid,
+      'claims_guard',
+      ${input.contentRef ? sql`${input.contentRef}::uuid` : sql`NULL`},
+      ${verdict},
+      ${JSON.stringify(strippedClaims)}::jsonb,
+      ${input.contentKind},
+      ${input.contentRef ? sql`${input.contentRef}::uuid` : sql`NULL`},
+      ${JSON.stringify(strippedClaims)}::jsonb,
+      ${rewritten.rewrittenText}
+    )
+    RETURNING id
+  `;
 
   return {
     verdict,
     strippedClaims,
-    rewrittenText,
-    checkId,
+    rewrittenText: rewritten.rewrittenText,
+    contentCheckId: inserted[0].id,
   };
 }

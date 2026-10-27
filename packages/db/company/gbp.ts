@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS gbp_locations (
   place_id              text,
   maps_uri              text,
   timezone              text,
+  state                 text,
   review_count          integer NOT NULL DEFAULT 0,
   average_rating        numeric(2,1),
   media_count           integer NOT NULL DEFAULT 0,

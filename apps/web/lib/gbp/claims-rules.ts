@@ -1,182 +1,167 @@
-export type GbpContentKind = "review_reply" | "post";
+export type ClaimsContentKind = "review_reply" | "local_post";
 
-export interface ClaimsRuleMatch {
-  code:
-    | "superlative"
-    | "number_one"
-    | "guarantee"
-    | "price_claim"
-    | "warranty_claim"
-    | "license_number_claim"
-    | "competitor_name"
-    | "medical_advice"
-    | "legal_advice";
-  label: string;
-  severity: "low" | "medium" | "high";
+export type ClaimRuleKind =
+  | "superlative"
+  | "guarantee"
+  | "price_figure"
+  | "warranty_term"
+  | "license_number_claim"
+  | "competitor_name"
+  | "medical_legal_advice"
+  | "generic_claim";
+
+export interface ClaimRule {
+  id: string;
+  kind: ClaimRuleKind;
+  description: string;
+  pattern: RegExp;
+}
+
+export interface FlaggedClaim {
+  ruleId: string;
+  ruleKind: ClaimRuleKind;
+  description: string;
   span: string;
   start: number;
   end: number;
-  state: string;
 }
 
-export interface ClaimsRuleInput {
-  text: string;
-  state: string | null | undefined;
-  contentKind: GbpContentKind;
-  competitorNames?: string[];
-}
-
-interface RuleDefinition {
-  code: ClaimsRuleMatch["code"];
-  label: string;
-  severity: ClaimsRuleMatch["severity"];
-  pattern: RegExp;
-  stateAllowlist?: string[];
-  stateBlocklist?: string[];
-}
-
-const BASE_RULES: RuleDefinition[] = [
+const BASE_RULES: ClaimRule[] = [
   {
-    code: "superlative",
-    label: "Superlative claim",
-    severity: "medium",
-    pattern: /\b(best|top[-\s]?rated|leading|premier|unmatched)\b/gi,
+    id: "superlative-best-in-city",
+    kind: "superlative",
+    description: "Unverifiable superlative claim",
+    pattern: /\b(best|top|leading|premier)\s+(plumber|hvac|contractor|service|company|team)\s+in\s+[A-Za-z][A-Za-z\s'-]{1,60}\b/gi,
   },
   {
-    code: "number_one",
-    label: "Ranking claim (#1)",
-    severity: "high",
-    pattern: /\b(#\s?1|number\s+one|no\.\s?1)\b/gi,
+    id: "superlative-number-one",
+    kind: "superlative",
+    description: "Numeric top-rank claim",
+    pattern: /(?:^|[^\w])(#\s?1|number\s+one)(?:[^\w]|$)/gi,
   },
   {
-    code: "guarantee",
-    label: "Guarantee claim",
-    severity: "high",
-    pattern: /\b(guaranteed?|100%\s*(satisfaction|guarantee)|we\s+promise)\b/gi,
+    id: "guaranteed-outcome",
+    kind: "guarantee",
+    description: "Guaranteed outcome language",
+    pattern: /\b(guaranteed|we\s+guarantee|100%\s+satisfaction|always\s+fixed|never\s+fails)\b/gi,
   },
   {
-    code: "price_claim",
-    label: "Price/discount claim",
-    severity: "medium",
-    pattern: /(\$\s?\d[\d,]*(\.\d{1,2})?|\b\d{1,3}%\s*(off|discount)\b)/gi,
+    id: "price-figure",
+    kind: "price_figure",
+    description: "Specific price figure in generated copy",
+    pattern: /\$\s?\d{1,4}(?:[.,]\d{2})?(?:\s?(?:\/|per)\s?(?:hour|hr|service|visit))?/gi,
   },
   {
-    code: "warranty_claim",
-    label: "Warranty term claim",
-    severity: "medium",
-    pattern: /\b(\d+\s*(day|month|year)s?\s*warranty|lifetime\s+warranty|warranty)\b/gi,
+    id: "warranty-term",
+    kind: "warranty_term",
+    description: "Warranty term claim",
+    pattern: /\b(\d+\s*(?:day|month|year|yr)s?\s+warranty|lifetime\s+warranty|warranty\s+included)\b/gi,
   },
   {
-    code: "license_number_claim",
-    label: "License number claim",
-    severity: "high",
-    pattern: /\b(licen[cs]e?\s*(#|number|no\.)\s*[a-z0-9-]+|licensed\s+and\s+insured)\b/gi,
+    id: "license-number",
+    kind: "license_number_claim",
+    description: "License number claim",
+    pattern: /\b(license(?:\s*(?:no|number|#))?\s*[:#-]?\s*[A-Za-z0-9-]{4,})\b/gi,
   },
   {
-    code: "medical_advice",
-    label: "Medical advice language",
-    severity: "high",
-    pattern:
-      /\b(diagnose|diagnosis|treat|treatment|cure|prescribe|medical advice|you should take)\b/gi,
-  },
-  {
-    code: "legal_advice",
-    label: "Legal advice language",
-    severity: "high",
-    pattern:
-      /\b(legal advice|you should sue|we guarantee you will win|attorney[-\s]?client)\b/gi,
+    id: "medical-legal-advice",
+    kind: "medical_legal_advice",
+    description: "Potential medical/legal advice",
+    pattern: /\b(legal\s+advice|you\s+should\s+sue|diagnose|prescribe|medical\s+advice|treatment\s+plan)\b/gi,
   },
 ];
 
-const STATE_RULE_OVERRIDES: Record<
-  string,
-  Partial<Record<ClaimsRuleMatch["code"], Pick<RuleDefinition, "severity">>>
-> = {
-  CA: {
-    superlative: { severity: "high" },
-    guarantee: { severity: "high" },
-  },
-  TX: {
-    license_number_claim: { severity: "high" },
-  },
-  FL: {
-    price_claim: { severity: "high" },
-  },
+const STATE_EXTRA_RULES: Record<string, ClaimRule[]> = {
+  CA: [
+    {
+      id: "ca-contractor-ad-claim",
+      kind: "generic_claim",
+      description: "California-tightened unverifiable contractor ad claim",
+      pattern: /\b(fully\s+licensed\s+and\s+insured|state-certified\s+specialists?)\b/gi,
+    },
+  ],
+  TX: [
+    {
+      id: "tx-emergency-time-guarantee",
+      kind: "guarantee",
+      description: "Texas-tightened guaranteed response-time claim",
+      pattern: /\b(we\s+will\s+arrive\s+in\s+\d+\s*(?:min|minutes)\s+guaranteed)\b/gi,
+    },
+  ],
+  FL: [
+    {
+      id: "fl-absolute-claim",
+      kind: "generic_claim",
+      description: "Florida-tightened absolute quality claim",
+      pattern: /\b(always\s+the\s+right\s+fix|perfect\s+repair\s+every\s+time)\b/gi,
+    },
+  ],
 };
 
-function normalizeState(state: string | null | undefined): string {
-  if (!state) return "US";
-  return state.trim().toUpperCase();
+export function normalizeStateCode(state: string | null | undefined): string {
+  return (state ?? "").trim().toUpperCase();
 }
 
-function pushMatchesForPattern(
+export function getClaimsRulesForState(state: string | null | undefined): ClaimRule[] {
+  const normalizedState: string = normalizeStateCode(state);
+  const extra: ClaimRule[] = STATE_EXTRA_RULES[normalizedState] ?? [];
+  return [...BASE_RULES, ...extra];
+}
+
+export function detectFlaggedClaims(
   text: string,
-  state: string,
-  definition: RuleDefinition,
-  out: ClaimsRuleMatch[],
-): void {
-  const regex = new RegExp(definition.pattern.source, definition.pattern.flags);
-  let match: RegExpExecArray | null = regex.exec(text);
+  rules: ClaimRule[],
+  competitorNames: string[] = [],
+): FlaggedClaim[] {
+  const normalizedText: string = text ?? "";
+  const findings: FlaggedClaim[] = [];
 
-  while (match) {
-    const span = match[0];
-    const start = match.index;
-    const end = start + span.length;
-    out.push({
-      code: definition.code,
-      label: definition.label,
-      severity: definition.severity,
-      span,
-      start,
-      end,
-      state,
-    });
-    match = regex.exec(text);
-  }
-}
-
-function buildCompetitorRule(competitorName: string): RuleDefinition | null {
-  const trimmed = competitorName.trim();
-  if (!trimmed) return null;
-  const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return {
-    code: "competitor_name",
-    label: "Competitor mention",
-    severity: "medium",
-    pattern: new RegExp(`\\b${escaped}\\b`, "gi"),
-  };
-}
-
-export function runClaimsRules(input: ClaimsRuleInput): ClaimsRuleMatch[] {
-  const state = normalizeState(input.state);
-  const text = input.text ?? "";
-  const matches: ClaimsRuleMatch[] = [];
-
-  for (const baseRule of BASE_RULES) {
-    const stateOverride = STATE_RULE_OVERRIDES[state]?.[baseRule.code];
-    const mergedRule: RuleDefinition = {
-      ...baseRule,
-      severity: stateOverride?.severity ?? baseRule.severity,
-    };
-
-    if (mergedRule.stateAllowlist && !mergedRule.stateAllowlist.includes(state)) continue;
-    if (mergedRule.stateBlocklist && mergedRule.stateBlocklist.includes(state)) continue;
-
-    pushMatchesForPattern(text, state, mergedRule, matches);
-  }
-
-  if (input.competitorNames && input.competitorNames.length > 0) {
-    for (const competitor of input.competitorNames) {
-      const competitorRule = buildCompetitorRule(competitor);
-      if (!competitorRule) continue;
-      pushMatchesForPattern(text, state, competitorRule, matches);
+  for (const rule of rules) {
+    const clonedPattern = new RegExp(rule.pattern.source, rule.pattern.flags);
+    for (const match of normalizedText.matchAll(clonedPattern)) {
+      const span: string = (match[0] ?? "").trim();
+      if (!span) continue;
+      const start: number = match.index ?? -1;
+      if (start < 0) continue;
+      const end: number = start + match[0].length;
+      findings.push({
+        ruleId: rule.id,
+        ruleKind: rule.kind,
+        description: rule.description,
+        span,
+        start,
+        end,
+      });
     }
   }
 
-  matches.sort((a, b) => {
-    if (a.start !== b.start) return a.start - b.start;
-    return b.end - a.end;
-  });
+  for (const competitor of competitorNames) {
+    const name: string = competitor.trim();
+    if (!name) continue;
+    const escaped: string = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const competitorPattern = new RegExp(`\\b${escaped}\\b`, "gi");
+    for (const match of normalizedText.matchAll(competitorPattern)) {
+      const span: string = (match[0] ?? "").trim();
+      if (!span) continue;
+      const start: number = match.index ?? -1;
+      if (start < 0) continue;
+      const end: number = start + match[0].length;
+      findings.push({
+        ruleId: `competitor-${name.toLowerCase().replace(/\s+/g, "-")}`,
+        ruleKind: "competitor_name",
+        description: "Competitor mention in marketing copy",
+        span,
+        start,
+        end,
+      });
+    }
+  }
 
-  return matches;
+  const dedup = new Map<string, FlaggedClaim>();
+  for (const finding of findings) {
+    const key = `${finding.ruleId}:${finding.start}:${finding.end}:${finding.span.toLowerCase()}`;
+    if (!dedup.has(key)) dedup.set(key, finding);
+  }
+
+  return [...dedup.values()].sort((a, b) => a.start - b.start);
 }
