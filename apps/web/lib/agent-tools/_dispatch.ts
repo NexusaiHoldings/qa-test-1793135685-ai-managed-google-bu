@@ -24,6 +24,7 @@
  */
 
 import type { HandlerContext, HandlerResult } from "@nexus/identity-and-access";
+import { handlePauseLocationAutomation } from "./pause_location_automation";
 import { handlePublishGbpPost } from "./publish_gbp_post";
 import { handlePublishReviewReply } from "./publish_review_reply";
 
@@ -36,4 +37,6 @@ export const DOMAIN_DISPATCH: Record<
   // Build agent appends entries here per CTO-declared new_domain_tool.
   publish_review_reply: (ctx, a) => handlePublishReviewReply(ctx, a),
   publish_gbp_post: (ctx, a) => handlePublishGbpPost(ctx, a),
+  pause_location_automation: (ctx, a) => handlePauseLocationAutomation(ctx, a),
 };
+
