@@ -260,4 +260,39 @@ CREATE TABLE IF NOT EXISTS gbp_notification_watches (
   updated_at           timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_gbp_notification_watches_location ON gbp_notification_watches (location_id);
+
+-- ── Review Response Engine additions (Feature F1-005) ──────────────────────────
+-- The core value loop: a synced review is risk-classified, drafted in-voice,
+-- claims-guarded, then either auto-published, routed to the owner to approve, or
+-- escalated to the team. The tier + draft + publish status live on gbp_reviews so
+-- the owner's /reviews feed can render a status pill without extra joins.
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS risk_tier         text;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS risk_reasons      jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS classified_at     timestamptz;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_reply       text;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_response_id uuid;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS content_check_id  uuid;
+-- reply_status: pending | auto_queued | awaiting_owner | with_team | published | blocked
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS reply_status      text NOT NULL DEFAULT 'pending';
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS drafted_at        timestamptz;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS published_at      timestamptz;
+CREATE INDEX IF NOT EXISTS idx_gbp_reviews_reply_status ON gbp_reviews (location_id, reply_status);
+
+-- 17. Review escalations (human_review-tier reviews routed to the team + a
+-- @nexus/support-and-help ticket). Distinct from the F1-002 backfill table — this
+-- is the live escalation record the /reviews feed reads to show "With our team".
+CREATE TABLE IF NOT EXISTS gbp_escalations (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  review_id          uuid NOT NULL,
+  location_id        uuid NOT NULL,
+  tier               text NOT NULL DEFAULT 'human_review',
+  reason             text,
+  reasons            jsonb NOT NULL DEFAULT '[]'::jsonb,
+  support_ticket_id  uuid,
+  status             text NOT NULL DEFAULT 'open',
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  resolved_at        timestamptz,
+  CONSTRAINT gbp_escalations_unique UNIQUE (review_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gbp_escalations_location ON gbp_escalations (location_id, status);
 `;
