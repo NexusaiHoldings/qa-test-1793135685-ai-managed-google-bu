@@ -1,174 +1,141 @@
-import { query } from "@/lib/db";
-import { getAutomationPauseState } from "@/lib/gbp/automation-pause";
+import { Pool } from "pg";
+import { getAutomationPauseMap } from "@/lib/gbp/automation-pause";
 
-export interface EscalationQueueItem {
-  escalationId: string;
-  severity: string;
-  category: string;
-  action: string;
-  agentRationale: string | null;
-  draftedReply: string | null;
-  editedReply: string | null;
-  actionNote: string | null;
-  createdAt: string;
-  locationId: string;
-  locationTitle: string | null;
-  reviewId: string | null;
-  reviewerName: string | null;
-  reviewComment: string | null;
-  starRating: number | null;
-  tokenCostInput: number;
-  tokenCostOutput: number;
-  providerSpendUsd: string;
-  quotaUnits: number;
-}
-
-export interface FleetHealthRow {
-  locationId: string;
+type LocationHealthRow = {
+  location_id: string;
   title: string | null;
   timezone: string | null;
-  paused: boolean;
-  pauseReason: string | null;
+  state: string | null;
+  last_sync_at: Date | null;
+  last_sync_status: string | null;
+  quota_events_24h: string;
+  auth_revocations_30d: string;
+  suspension_signals_30d: string;
+};
+
+export type LocationHealth = {
+  locationId: string;
+  title: string;
+  timezone: string | null;
+  state: string | null;
   lastSyncAt: string | null;
   lastSyncStatus: string | null;
   quotaEvents24h: number;
   authRevocations30d: number;
   suspensionSignals30d: number;
-  tokenCost30d: number;
-  providerSpend30d: string;
+  automationPaused: boolean;
+};
+
+export type FleetHealth = {
+  fleetPaused: boolean;
+  totalLocations: number;
+  pausedLocations: number;
+  healthyLocations: number;
+  degradedLocations: number;
+  locations: LocationHealth[];
+};
+
+let pool: Pool | null = null;
+
+function getPool(): Pool {
+  if (pool) return pool;
+  const connectionString: string | undefined = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error("DATABASE_URL is required");
+  }
+  pool = new Pool({ connectionString });
+  return pool;
 }
 
-export async function listEscalations(filters: {
-  severity?: string;
-  action?: string;
-  locationId?: string;
-}): Promise<EscalationQueueItem[]> {
-  const rows = await query<any>(
-    `SELECT
-      e.id AS escalation_id,
-      e.severity,
-      e.category,
-      e.action,
-      e.agent_rationale,
-      e.drafted_reply,
-      e.edited_reply,
-      e.action_note,
-      e.created_at,
-      e.location_id,
-      l.title AS location_title,
-      r.id AS review_id,
-      r.reviewer_name,
-      r.comment AS review_comment,
-      r.star_rating,
-      e.token_cost_input,
-      e.token_cost_output,
-      e.provider_spend_usd,
-      e.quota_units
-     FROM gbp_escalations e
-     LEFT JOIN gbp_locations l ON l.id = e.location_id
-     LEFT JOIN gbp_reviews r ON r.id = e.review_id
-     WHERE ($1::text IS NULL OR e.severity = $1)
-       AND ($2::text IS NULL OR e.action = $2)
-       AND ($3::uuid IS NULL OR e.location_id = $3::uuid)
-     ORDER BY e.created_at DESC
-     LIMIT 200`,
-    [filters.severity ?? null, filters.action ?? null, filters.locationId ?? null],
-  );
+export async function getFleetHealth(): Promise<FleetHealth> {
+  const db = getPool();
+  const pauseMap = await getAutomationPauseMap();
 
-  return rows.map((r: any) => ({
-    escalationId: r.escalation_id,
-    severity: r.severity,
-    category: r.category,
-    action: r.action,
-    agentRationale: r.agent_rationale,
-    draftedReply: r.drafted_reply,
-    editedReply: r.edited_reply,
-    actionNote: r.action_note,
-    createdAt: r.created_at,
-    locationId: r.location_id,
-    locationTitle: r.location_title,
-    reviewId: r.review_id,
-    reviewerName: r.reviewer_name,
-    reviewComment: r.review_comment,
-    starRating: r.star_rating,
-    tokenCostInput: Number(r.token_cost_input ?? 0),
-    tokenCostOutput: Number(r.token_cost_output ?? 0),
-    providerSpendUsd: String(r.provider_spend_usd ?? "0"),
-    quotaUnits: Number(r.quota_units ?? 0),
-  }));
-}
-
-export async function getFleetHealth(): Promise<{ fleetPaused: boolean; rows: FleetHealthRow[] }> {
-  const fleetPause = await getAutomationPauseState();
-
-  const rows = await query<any>(
-    `SELECT
+  const sql = `
+    WITH latest_sync AS (
+      SELECT DISTINCT ON (location_id)
+        location_id, started_at, status
+      FROM gbp_sync_runs
+      WHERE location_id IS NOT NULL
+      ORDER BY location_id, started_at DESC
+    ),
+    quota_events AS (
+      SELECT location_id, COUNT(*)::int AS c
+      FROM gbp_api_health_events
+      WHERE quota_exceeded = true
+        AND created_at >= now() - interval '24 hours'
+      GROUP BY location_id
+    ),
+    auth_revocations AS (
+      SELECT location_id, COUNT(*)::int AS c
+      FROM gbp_api_health_events
+      WHERE (error_code = 'auth_revoked' OR status_code = 401)
+        AND created_at >= now() - interval '30 days'
+      GROUP BY location_id
+    ),
+    suspension_signals AS (
+      SELECT location_id, COUNT(*)::int AS c
+      FROM gbp_api_health_events
+      WHERE (error_code = 'suspended' OR status_code = 403)
+        AND created_at >= now() - interval '30 days'
+      GROUP BY location_id
+    )
+    SELECT
       l.id AS location_id,
       l.title,
       l.timezone,
-      COALESCE(p.is_paused, false) AS paused,
-      p.reason AS pause_reason,
-      s.finished_at AS last_sync_at,
+      l.state,
+      s.started_at AS last_sync_at,
       s.status AS last_sync_status,
-      COALESCE((
-        SELECT COUNT(*) FROM gbp_api_health_events hq
-        WHERE hq.location_id = l.id
-          AND hq.quota_exceeded = true
-          AND hq.created_at >= now() - interval '24 hours'
-      ), 0) AS quota_events_24h,
-      COALESCE((
-        SELECT COUNT(*) FROM gbp_api_health_events ha
-        WHERE ha.location_id = l.id
-          AND (ha.error_code = 'AUTH_REVOKED' OR ha.status_code = 401)
-          AND ha.created_at >= now() - interval '30 days'
-      ), 0) AS auth_revocations_30d,
-      COALESCE((
-        SELECT COUNT(*) FROM gbp_api_health_events hs
-        WHERE hs.location_id = l.id
-          AND (hs.error_code = 'SUSPENSION_SIGNAL' OR hs.status_code = 423)
-          AND hs.created_at >= now() - interval '30 days'
-      ), 0) AS suspension_signals_30d,
-      COALESCE((
-        SELECT SUM(e2.token_cost_input + e2.token_cost_output)::bigint
-        FROM gbp_escalations e2
-        WHERE e2.location_id = l.id
-          AND e2.created_at >= now() - interval '30 days'
-      ), 0) AS token_cost_30d,
-      COALESCE((
-        SELECT SUM(e3.provider_spend_usd)
-        FROM gbp_escalations e3
-        WHERE e3.location_id = l.id
-          AND e3.created_at >= now() - interval '30 days'
-      ), 0) AS provider_spend_30d
-     FROM gbp_locations l
-     LEFT JOIN LATERAL (
-      SELECT finished_at, status
-      FROM gbp_sync_runs ss
-      WHERE ss.location_id = l.id
-      ORDER BY ss.started_at DESC
-      LIMIT 1
-     ) s ON true
-     LEFT JOIN gbp_automation_pauses p
-       ON p.scope = 'location' AND p.location_id = l.id
-     ORDER BY l.title NULLS LAST, l.linked_at DESC`,
-    [],
-  );
+      COALESCE(q.c, 0)::text AS quota_events_24h,
+      COALESCE(a.c, 0)::text AS auth_revocations_30d,
+      COALESCE(ss.c, 0)::text AS suspension_signals_30d
+    FROM gbp_locations l
+    LEFT JOIN latest_sync s ON s.location_id = l.id
+    LEFT JOIN quota_events q ON q.location_id = l.id
+    LEFT JOIN auth_revocations a ON a.location_id = l.id
+    LEFT JOIN suspension_signals ss ON ss.location_id = l.id
+    ORDER BY l.linked_at DESC
+  `;
+  const result = await db.query<LocationHealthRow>(sql);
+
+  const locations: LocationHealth[] = result.rows.map((row) => {
+    const pausedByLocation = Boolean(pauseMap.byLocationId[row.location_id]?.paused);
+    return {
+      locationId: row.location_id,
+      title: row.title ?? "Untitled location",
+      timezone: row.timezone,
+      state: row.state,
+      lastSyncAt: row.last_sync_at ? row.last_sync_at.toISOString() : null,
+      lastSyncStatus: row.last_sync_status,
+      quotaEvents24h: Number(row.quota_events_24h),
+      authRevocations30d: Number(row.auth_revocations_30d),
+      suspensionSignals30d: Number(row.suspension_signals_30d),
+      automationPaused: pauseMap.fleetPaused || pausedByLocation,
+    };
+  });
+
+  let healthyLocations = 0;
+  let degradedLocations = 0;
+  let pausedLocations = 0;
+
+  for (const location of locations) {
+    if (location.automationPaused) pausedLocations += 1;
+    const degraded =
+      location.quotaEvents24h > 0 ||
+      location.authRevocations30d > 0 ||
+      location.suspensionSignals30d > 0 ||
+      location.lastSyncStatus === "failed";
+    if (degraded) degradedLocations += 1;
+    else healthyLocations += 1;
+  }
 
   return {
-    fleetPaused: fleetPause.isPaused,
-    rows: rows.map((r: any) => ({
-      locationId: r.location_id,
-      title: r.title,
-      timezone: r.timezone,
-      paused: r.paused,
-      pauseReason: r.pause_reason,
-      lastSyncAt: r.last_sync_at,
-      lastSyncStatus: r.last_sync_status,
-      quotaEvents24h: Number(r.quota_events_24h ?? 0),
-      authRevocations30d: Number(r.auth_revocations_30d ?? 0),
-      suspensionSignals30d: Number(r.suspension_signals_30d ?? 0),
-      tokenCost30d: Number(r.token_cost_30d ?? 0),
-      providerSpend30d: String(r.provider_spend_30d ?? "0"),
-    })),
+    fleetPaused: pauseMap.fleetPaused,
+    totalLocations: locations.length,
+    pausedLocations,
+    healthyLocations,
+    degradedLocations,
+    locations,
   };
 }

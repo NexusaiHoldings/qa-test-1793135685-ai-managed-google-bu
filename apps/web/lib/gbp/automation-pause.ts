@@ -1,98 +1,126 @@
-import { query } from "@/lib/db";
+import { Pool } from "pg";
 
-export type AutomationPauseScope = "fleet" | "location";
+export type PauseScope = "fleet" | "location";
 
-export interface AutomationPauseState {
-  scope: AutomationPauseScope;
+export type AutomationPauseState = {
+  scope: PauseScope;
   locationId: string | null;
-  isPaused: boolean;
+  paused: boolean;
   reason: string | null;
-  pausedBy: string | null;
+  actorEmail: string | null;
+  source: string;
   pausedAt: string | null;
-  resumeAt: string | null;
+  resumedAt: string | null;
   updatedAt: string;
+};
+
+type DbRow = {
+  scope: PauseScope;
+  location_id: string | null;
+  paused: boolean;
+  reason: string | null;
+  actor_email: string | null;
+  source: string;
+  paused_at: Date | null;
+  resumed_at: Date | null;
+  updated_at: Date;
+};
+
+let pool: Pool | null = null;
+
+function getPool(): Pool {
+  if (pool) return pool;
+  const connectionString: string | undefined = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error("DATABASE_URL is required");
+  }
+  pool = new Pool({ connectionString });
+  return pool;
 }
 
-export async function getAutomationPauseState(locationId?: string): Promise<AutomationPauseState> {
-  const scope: AutomationPauseScope = locationId ? "location" : "fleet";
-  const rows = await query<{
-    scope: AutomationPauseScope;
-    location_id: string | null;
-    is_paused: boolean;
-    reason: string | null;
-    paused_by: string | null;
-    paused_at: string | null;
-    resume_at: string | null;
-    updated_at: string;
-  }>(
-    `SELECT scope, location_id, is_paused, reason, paused_by, paused_at, resume_at, updated_at
-     FROM gbp_automation_pauses
-     WHERE scope = $1 AND (
-       ($2::uuid IS NULL AND location_id IS NULL) OR location_id = $2::uuid
-     )
-     LIMIT 1`,
-    [scope, locationId ?? null],
-  );
-
-  if (rows.length === 0) {
-    return {
-      scope,
-      locationId: locationId ?? null,
-      isPaused: false,
-      reason: null,
-      pausedBy: null,
-      pausedAt: null,
-      resumeAt: null,
-      updatedAt: new Date().toISOString(),
-    };
-  }
-
-  const row = rows[0];
+function mapRow(row: DbRow): AutomationPauseState {
   return {
     scope: row.scope,
     locationId: row.location_id,
-    isPaused: row.is_paused,
+    paused: row.paused,
     reason: row.reason,
-    pausedBy: row.paused_by,
-    pausedAt: row.paused_at,
-    resumeAt: row.resume_at,
-    updatedAt: row.updated_at,
+    actorEmail: row.actor_email,
+    source: row.source,
+    pausedAt: row.paused_at ? row.paused_at.toISOString() : null,
+    resumedAt: row.resumed_at ? row.resumed_at.toISOString() : null,
+    updatedAt: row.updated_at.toISOString(),
   };
 }
 
-export async function setAutomationPause(params: {
-  scope: AutomationPauseScope;
-  locationId?: string;
-  isPaused: boolean;
-  reason?: string;
-  pausedBy?: string;
-  resumeAt?: string | null;
+export async function setAutomationPause(input: {
+  scope: PauseScope;
+  locationId?: string | null;
+  paused: boolean;
+  reason?: string | null;
+  actorUserId?: string | null;
+  actorEmail?: string | null;
+  source?: string;
 }): Promise<AutomationPauseState> {
-  const locationId = params.scope === "fleet" ? null : params.locationId ?? null;
-  const pausedAt = params.isPaused ? new Date().toISOString() : null;
-
-  await query(
-    `INSERT INTO gbp_automation_pauses (
-      scope, location_id, is_paused, reason, paused_by, paused_at, resume_at, updated_at
-    ) VALUES ($1, $2::uuid, $3, $4, $5::uuid, $6::timestamptz, $7::timestamptz, now())
-    ON CONFLICT (scope, location_id)
-    DO UPDATE SET
-      is_paused = EXCLUDED.is_paused,
+  const db: Pool = getPool();
+  const locationId: string | null = input.scope === "fleet" ? null : (input.locationId ?? null);
+  const source: string = input.source ?? "operator_console";
+  const sql = `
+    INSERT INTO gbp_automation_pauses (
+      scope, location_id, paused, reason, actor_user_id, actor_email, source, paused_at, resumed_at, updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $3 THEN now() ELSE NULL END, CASE WHEN $3 THEN NULL ELSE now() END, now())
+    ON CONFLICT (scope, location_id) DO UPDATE SET
+      paused = EXCLUDED.paused,
       reason = EXCLUDED.reason,
-      paused_by = EXCLUDED.paused_by,
-      paused_at = EXCLUDED.paused_at,
-      resume_at = EXCLUDED.resume_at,
-      updated_at = now()`,
-    [
-      params.scope,
-      locationId,
-      params.isPaused,
-      params.reason ?? null,
-      params.pausedBy ?? null,
-      pausedAt,
-      params.resumeAt ?? null,
-    ],
+      actor_user_id = EXCLUDED.actor_user_id,
+      actor_email = EXCLUDED.actor_email,
+      source = EXCLUDED.source,
+      paused_at = CASE
+        WHEN EXCLUDED.paused = true AND gbp_automation_pauses.paused = false THEN now()
+        ELSE gbp_automation_pauses.paused_at
+      END,
+      resumed_at = CASE
+        WHEN EXCLUDED.paused = false AND gbp_automation_pauses.paused = true THEN now()
+        ELSE gbp_automation_pauses.resumed_at
+      END,
+      updated_at = now()
+    RETURNING scope, location_id, paused, reason, actor_email, source, paused_at, resumed_at, updated_at
+  `;
+  const result = await db.query<DbRow>(sql, [
+    input.scope,
+    locationId,
+    input.paused,
+    input.reason ?? null,
+    input.actorUserId ?? null,
+    input.actorEmail ?? null,
+    source,
+  ]);
+  return mapRow(result.rows[0]);
+}
+
+export async function getAutomationPauseMap(): Promise<{
+  fleetPaused: boolean;
+  byLocationId: Record<string, AutomationPauseState>;
+}> {
+  const db: Pool = getPool();
+  const result = await db.query<DbRow>(
+    `SELECT scope, location_id, paused, reason, actor_email, source, paused_at, resumed_at, updated_at
+     FROM gbp_automation_pauses`
   );
 
-  return getAutomationPauseState(locationId ?? undefined);
+  const byLocationId: Record<string, AutomationPauseState> = {};
+  let fleetPaused = false;
+
+  for (const row of result.rows) {
+    const state = mapRow(row);
+    if (row.scope === "fleet") {
+      fleetPaused = row.paused;
+      continue;
+    }
+    if (row.location_id) {
+      byLocationId[row.location_id] = state;
+    }
+  }
+
+  return { fleetPaused, byLocationId };
 }

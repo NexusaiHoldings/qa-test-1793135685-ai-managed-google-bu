@@ -1,68 +1,98 @@
 import { redirect } from "next/navigation";
 import { getAdminUser } from "@nexus/admin-console";
-import { listEscalations } from "@/lib/gbp/platform-health";
 
-interface PageProps {
-  searchParams?: Record<string, string | string[] | undefined>;
+type Escalation = {
+  id: string;
+  reviewId: string | null;
+  locationId: string;
+  locationTitle: string;
+  reason: string | null;
+  riskLevel: string;
+  status: string;
+  createdAt: string;
+  agentRationale: string | null;
+  draftedReply: string | null;
+  editedReply: string | null;
+  reviewerName: string | null;
+  starRating: number | null;
+  comment: string | null;
+};
+
+async function fetchEscalations(): Promise<Escalation[]> {
+  const res = await fetch(`${process.env.NEXTAUTH_URL ?? ""}/admin/api/escalations`, { cache: "no-store" });
+  if (!res.ok) return [];
+  const data = (await res.json()) as { escalations: Escalation[] };
+  return data.escalations ?? [];
 }
 
-export default async function EscalationsPage({ searchParams }: PageProps): Promise<JSX.Element> {
-  const admin = await getAdminUser();
-  if (!admin) redirect("/");
+function severityColor(level: string): string {
+  if (level === "high") return "#b91c1c";
+  if (level === "medium") return "#b45309";
+  return "#1f2937";
+}
 
-  const severity = typeof searchParams?.severity === "string" ? searchParams.severity : undefined;
-  const action = typeof searchParams?.action === "string" ? searchParams.action : undefined;
-  const items = await listEscalations({ severity, action });
+export default async function EscalationsPage(): Promise<JSX.Element> {
+  const adminUser = await getAdminUser();
+  if (!adminUser) redirect("/");
+
+  const escalations = await fetchEscalations();
 
   return (
     <main>
       <h1>Escalations</h1>
-      <p>Operator queue for sensitive GBP review replies and manual intervention.</p>
-      <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: "1rem" }}>
-        <aside className="card">
-          <form method="get">
-            <label>Severity</label>
-            <select name="severity" defaultValue={severity ?? ""}>
-              <option value="">All</option>
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
-              <option value="critical">critical</option>
-            </select>
-            <label>Action</label>
-            <select name="action" defaultValue={action ?? ""}>
-              <option value="">All</option>
-              <option value="open">open</option>
-              <option value="approved">approved</option>
-              <option value="edited_published">edited_published</option>
-              <option value="manual_offline">manual_offline</option>
-              <option value="dismissed">dismissed</option>
-            </select>
-            <button type="submit">Apply filters</button>
-          </form>
-        </aside>
-        <section>
-          {items.length === 0 ? (
-            <div className="empty">No escalations — the agent is handling everything.</div>
-          ) : (
-            items.map((item) => (
-              <article key={item.escalationId} className="card" style={{ borderLeft: "6px solid #6b7280", marginBottom: "0.75rem" }}>
+      <p>Human-in-the-loop queue for sensitive GBP review situations and operator actions.</p>
+
+      {escalations.length === 0 ? (
+        <div className="empty">No escalations — the agent is handling everything</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: "1rem" }}>
+          <aside className="card">
+            <h3>Filters</h3>
+            <ul>
+              <li>Open first</li>
+              <li>Risk tier</li>
+              <li>Location</li>
+            </ul>
+            <p className="muted">Use API actions from internal tooling for now.</p>
+          </aside>
+
+          <section style={{ display: "grid", gap: "0.75rem" }}>
+            {escalations.map((e) => (
+              <article
+                key={e.id}
+                className="card"
+                style={{ borderLeft: `6px solid ${severityColor(e.riskLevel)}` }}
+              >
+                <h3>
+                  {e.locationTitle} · {e.riskLevel.toUpperCase()} · {e.status}
+                </h3>
                 <p className="muted">
-                  {item.severity.toUpperCase()} · {item.category} · {new Date(item.createdAt).toLocaleString()}
+                  Reviewer: {e.reviewerName ?? "Unknown"} {e.starRating ? `· ${e.starRating}★` : ""} ·{" "}
+                  {new Date(e.createdAt).toLocaleString()}
                 </p>
-                <h3>{item.locationTitle ?? item.locationId}</h3>
-                <p><strong>Review:</strong> {item.reviewComment ?? "No review text"}</p>
-                <p><strong>Agent rationale:</strong> {item.agentRationale ?? "—"}</p>
-                <p><strong>Draft:</strong> {item.draftedReply ?? "—"}</p>
-                {item.editedReply ? (
-                  <pre>{`- ${item.draftedReply ?? ""}
-+ ${item.editedReply}`}</pre>
-                ) : null}
+                <p>{e.comment ?? "No review body."}</p>
+                <p>
+                  <strong>Reason:</strong> {e.reason ?? "—"}
+                </p>
+                <p>
+                  <strong>Agent rationale:</strong> {e.agentRationale ?? "—"}
+                </p>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem" }}>
+                  <div>
+                    <h4>Drafted reply</h4>
+                    <pre style={{ whiteSpace: "pre-wrap" }}>{e.draftedReply ?? "—"}</pre>
+                  </div>
+                  <div>
+                    <h4>Edited reply (diff view)</h4>
+                    <pre style={{ whiteSpace: "pre-wrap" }}>{e.editedReply ?? "(no edits yet)"}</pre>
+                  </div>
+                </div>
               </article>
-            ))
-          )}
-        </section>
-      </div>
+            ))}
+          </section>
+        </div>
+      )}
     </main>
   );
 }

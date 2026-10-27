@@ -271,49 +271,37 @@ ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_generated_at timestamptz;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_model       text;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approval_status   text NOT NULL DEFAULT 'pending';
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approved_at       timestamptz;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS published_at      timestamptz;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS escalated         boolean NOT NULL DEFAULT false;
-CREATE INDEX IF NOT EXISTS idx_gbp_reviews_approval_status ON gbp_reviews (location_id, approval_status, review_created_at DESC);
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approval_actor_id uuid;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approval_note     text;
 
--- ── Operator Escalation Queue additions (Feature F1-010) ──────────────────────
-CREATE TABLE IF NOT EXISTS gbp_escalations (
-  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  review_id          uuid,
-  location_id        uuid NOT NULL,
-  severity           text NOT NULL DEFAULT 'medium',
-  category           text NOT NULL DEFAULT 'sensitive',
-  agent_rationale    text,
-  drafted_reply      text,
-  edited_reply       text,
-  action             text NOT NULL DEFAULT 'open',
-  action_taken_by    uuid,
-  action_note        text,
-  action_taken_at    timestamptz,
-  dismissed_reason   text,
-  token_cost_input   integer NOT NULL DEFAULT 0,
-  token_cost_output  integer NOT NULL DEFAULT 0,
-  provider_spend_usd numeric(12,4) NOT NULL DEFAULT 0,
-  quota_units        integer NOT NULL DEFAULT 0,
-  created_at         timestamptz NOT NULL DEFAULT now(),
-  updated_at         timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_gbp_escalations_location_status ON gbp_escalations (location_id, action, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_gbp_escalations_review ON gbp_escalations (review_id);
+-- Human-in-the-loop escalation console additions (Feature F1-010).
+ALTER TABLE gbp_review_escalations ADD COLUMN IF NOT EXISTS agent_rationale      text;
+ALTER TABLE gbp_review_escalations ADD COLUMN IF NOT EXISTS drafted_reply        text;
+ALTER TABLE gbp_review_escalations ADD COLUMN IF NOT EXISTS edited_reply         text;
+ALTER TABLE gbp_review_escalations ADD COLUMN IF NOT EXISTS action               text;
+ALTER TABLE gbp_review_escalations ADD COLUMN IF NOT EXISTS action_note          text;
+ALTER TABLE gbp_review_escalations ADD COLUMN IF NOT EXISTS acted_by             uuid;
+ALTER TABLE gbp_review_escalations ADD COLUMN IF NOT EXISTS acted_at             timestamptz;
+ALTER TABLE gbp_review_escalations ADD COLUMN IF NOT EXISTS external_reply_posted boolean NOT NULL DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_gbp_review_escalations_status_created
+  ON gbp_review_escalations (status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS gbp_automation_pauses (
   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  scope            text NOT NULL DEFAULT 'location',
   location_id      uuid,
-  is_paused        boolean NOT NULL DEFAULT false,
+  scope            text NOT NULL DEFAULT 'location',
+  paused           boolean NOT NULL DEFAULT false,
   reason           text,
-  paused_by        uuid,
+  actor_user_id    uuid,
+  actor_email      text,
+  source           text NOT NULL DEFAULT 'operator_console',
   paused_at        timestamptz,
-  resume_at        timestamptz,
+  resumed_at       timestamptz,
+  created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT gbp_automation_pauses_unique_scope UNIQUE (scope, location_id)
+  CONSTRAINT gbp_automation_pauses_scope_check UNIQUE (scope, location_id)
 );
-CREATE INDEX IF NOT EXISTS idx_gbp_automation_pauses_scope ON gbp_automation_pauses (scope, is_paused);
 
-CREATE INDEX IF NOT EXISTS idx_gbp_api_health_location_created
-  ON gbp_api_health_events (location_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gbp_automation_pauses_scope ON gbp_automation_pauses (scope, paused, updated_at DESC);
 `;

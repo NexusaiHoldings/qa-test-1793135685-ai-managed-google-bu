@@ -1,41 +1,62 @@
-import { NextRequest, NextResponse } from "next/server";
-import { getAdminUser, logAdminEvent } from "@nexus/admin-console";
+import { NextResponse } from "next/server";
+import { getAdminUser, writeAdminAuditLog } from "@nexus/admin-console";
 import { getFleetHealth } from "@/lib/gbp/platform-health";
 import { setAutomationPause } from "@/lib/gbp/automation-pause";
 
-export async function GET(): Promise<NextResponse> {
-  const admin = await getAdminUser();
-  if (!admin) return NextResponse.json({ error: "forbidden" }, { status: 403 });
+type PauseBody = {
+  scope: "fleet" | "location";
+  locationId?: string;
+  paused: boolean;
+  reason?: string;
+};
 
-  const data = await getFleetHealth();
-  return NextResponse.json(data);
+export async function GET(): Promise<NextResponse> {
+  const adminUser = await getAdminUser();
+  if (!adminUser) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
+
+  const health = await getFleetHealth();
+  return NextResponse.json({ health });
 }
 
-export async function POST(req: NextRequest): Promise<NextResponse> {
-  const admin = await getAdminUser();
-  if (!admin) return NextResponse.json({ error: "forbidden" }, { status: 403 });
+export async function POST(request: Request): Promise<NextResponse> {
+  const adminUser = await getAdminUser();
+  if (!adminUser) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
 
-  const body = (await req.json()) as {
-    scope: "fleet" | "location";
-    locationId?: string;
-    isPaused: boolean;
-    reason?: string;
-  };
+  const body = (await request.json()) as PauseBody;
+  if (!body || typeof body.paused !== "boolean" || (body.scope !== "fleet" && body.scope !== "location")) {
+    return NextResponse.json({ error: "invalid_payload" }, { status: 400 });
+  }
+
+  if (body.scope === "location" && !body.locationId) {
+    return NextResponse.json({ error: "locationId required for location scope" }, { status: 400 });
+  }
 
   const state = await setAutomationPause({
     scope: body.scope,
-    locationId: body.locationId,
-    isPaused: body.isPaused,
-    reason: body.reason,
-    pausedBy: admin.id,
+    locationId: body.locationId ?? null,
+    paused: body.paused,
+    reason: body.reason ?? null,
+    actorUserId: adminUser.id,
+    actorEmail: adminUser.email ?? null,
+    source: "operator_health_console",
   });
 
-  await logAdminEvent({
-    actorId: admin.id,
-    action: "gbp.automation.pause",
-    target: body.scope === "fleet" ? "fleet" : body.locationId ?? "unknown",
-    details: { isPaused: body.isPaused, reason: body.reason ?? null },
+  await writeAdminAuditLog({
+    actorUserId: adminUser.id,
+    actorEmail: adminUser.email ?? null,
+    action: state.paused ? "gbp.automation.pause" : "gbp.automation.resume",
+    target: state.scope === "fleet" ? "fleet" : `location:${state.locationId}`,
+    metadata: {
+      scope: state.scope,
+      locationId: state.locationId,
+      reason: state.reason,
+      source: state.source,
+    },
   });
 
-  return NextResponse.json({ ok: true, state });
+  return NextResponse.json({ state });
 }
