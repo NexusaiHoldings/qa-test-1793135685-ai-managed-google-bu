@@ -1,14 +1,15 @@
 "use server";
 
+import { revalidatePath } from "next/cache";
 import { Pool } from "pg";
-import { getServerSession } from "@nexus/identity-and-access";
+import { getSessionUser } from "@/lib/admin-auth";
 import { suggestKeywords } from "@/lib/gbp/keywords";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 export async function seedKeywordsAction(locationId: string): Promise<{ seeded: number }> {
-  const session = await getServerSession();
-  const userId = session?.user?.id;
+  const user = await getSessionUser();
+  const userId = user?.id;
   if (!userId) return { seeded: 0 };
 
   const client = await pool.connect();
@@ -43,6 +44,7 @@ export async function seedKeywordsAction(locationId: string): Promise<{ seeded: 
       seeded += result.rowCount ?? 0;
     }
 
+    revalidatePath("/rankings");
     return { seeded };
   } finally {
     client.release();

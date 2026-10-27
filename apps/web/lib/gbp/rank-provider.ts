@@ -1,4 +1,14 @@
-import { z } from "zod";
+/**
+ * DataForSEO local-pack rank provider — Feature F1-008.
+ *
+ * Wraps the DataForSEO Google Maps (local-pack) SERP endpoint behind a small
+ * provider interface so the rest of the app depends on {@link RankResult}, not
+ * on DataForSEO's payload shape (feasibility key_technical_risks[2] — we pay a
+ * stable API rather than scrape). Any provider failure (missing credentials,
+ * non-2xx, network error) degrades to `providerStatus: "delayed"` with a null
+ * rank so the /rankings page can show the last good snapshot with a "rankings
+ * delayed" badge rather than blank cells.
+ */
 
 export type RankProviderStatus = "ok" | "delayed";
 
@@ -16,14 +26,15 @@ export interface RankResult {
   providerStatus: RankProviderStatus;
 }
 
-const rankResultSchema = z.object({
-  keyword: z.string().min(1),
-  found: z.boolean(),
-  rank: z.number().int().positive().nullable(),
-  providerStatus: z.enum(["ok", "delayed"]),
-});
-
-const batchSchema = z.array(rankResultSchema);
+/** Build a uniform "delayed" batch for a provider outage / missing config. */
+function delayedBatch(queries: RankQuery[]): RankResult[] {
+  return queries.map((q) => ({
+    keyword: q.keyword,
+    found: false,
+    rank: null,
+    providerStatus: "delayed" as const,
+  }));
+}
 
 interface DataForSeoTaskResult {
   keyword: string;
@@ -57,14 +68,7 @@ export async function fetchLocalPackRanks(queries: RankQuery[]): Promise<RankRes
   const login = process.env.DATAFORSEO_LOGIN;
   const password = process.env.DATAFORSEO_PASSWORD;
   if (!login || !password) {
-    return batchSchema.parse(
-      queries.map((q) => ({
-        keyword: q.keyword,
-        found: false,
-        rank: null,
-        providerStatus: "delayed",
-      })),
-    );
+    return delayedBatch(queries);
   }
 
   try {
@@ -91,14 +95,7 @@ export async function fetchLocalPackRanks(queries: RankQuery[]): Promise<RankRes
     });
 
     if (!response.ok) {
-      return batchSchema.parse(
-        queries.map((q) => ({
-          keyword: q.keyword,
-          found: false,
-          rank: null,
-          providerStatus: "delayed",
-        })),
-      );
+      return delayedBatch(queries);
     }
 
     const json = (await response.json()) as DataForSeoResponse;
@@ -109,29 +106,20 @@ export async function fetchLocalPackRanks(queries: RankQuery[]): Promise<RankRes
       if (item.keyword) byKeyword.set(item.keyword.toLowerCase(), item);
     }
 
-    return batchSchema.parse(
-      queries.map((q) => {
-        const hit = byKeyword.get(q.keyword.toLowerCase());
-        if (!hit) {
-          return { keyword: q.keyword, found: false, rank: null, providerStatus: "ok" as const };
-        }
-        const rank = pickRank(hit);
-        return {
-          keyword: q.keyword,
-          found: rank !== null,
-          rank,
-          providerStatus: "ok" as const,
-        };
-      }),
-    );
-  } catch {
-    return batchSchema.parse(
-      queries.map((q) => ({
+    return queries.map((q) => {
+      const hit = byKeyword.get(q.keyword.toLowerCase());
+      if (!hit) {
+        return { keyword: q.keyword, found: false, rank: null, providerStatus: "ok" as const };
+      }
+      const rank = pickRank(hit);
+      return {
         keyword: q.keyword,
-        found: false,
-        rank: null,
-        providerStatus: "delayed",
-      })),
-    );
+        found: rank !== null,
+        rank,
+        providerStatus: "ok" as const,
+      };
+    });
+  } catch {
+    return delayedBatch(queries);
   }
 }

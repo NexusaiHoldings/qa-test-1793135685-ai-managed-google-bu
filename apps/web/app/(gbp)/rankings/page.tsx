@@ -1,6 +1,10 @@
+import type { JSX } from "react";
 import { Pool } from "pg";
-import { getServerSession } from "@nexus/identity-and-access";
+import { getSessionUser } from "@/lib/admin-auth";
 import { seedKeywordsAction } from "./actions";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs"; // pg + raw SQL — not edge-compatible
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -14,17 +18,43 @@ type Row = {
   history: Array<number | null>;
 };
 
-function deltaChip(curr: number | null, prev: number | null): string {
-  if (curr === null || prev === null) return "—";
+function deltaChip(curr: number | null, prev: number | null): { label: string; color: string } {
+  // Lower rank number = better position, so prev - curr > 0 means we moved up.
+  if (curr === null || prev === null) return { label: "—", color: "var(--muted, #888)" };
   const delta = prev - curr;
-  if (delta > 0) return `▲${delta}`;
-  if (delta < 0) return `▼${Math.abs(delta)}`;
-  return "—";
+  if (delta > 0) return { label: `▲${delta}`, color: "var(--success, #16a34a)" };
+  if (delta < 0) return { label: `▼${Math.abs(delta)}`, color: "var(--warning, #d97706)" };
+  return { label: "—", color: "var(--muted, #888)" };
+}
+
+// A tiny inline-SVG sparkline of the last snapshots (oldest → newest). Lower
+// rank sits higher on the chart, matching how owners read "position 1 is best".
+function sparkline(ranks: Array<number | null>): JSX.Element | null {
+  const points = ranks.filter((r): r is number => typeof r === "number");
+  if (points.length < 2) return null;
+  const width = 72;
+  const height = 24;
+  const max = Math.max(...points);
+  const min = Math.min(...points);
+  const span = max - min || 1;
+  const step = width / (points.length - 1);
+  const coords = points
+    .map((r, i) => {
+      const x = i * step;
+      const y = ((r - min) / span) * (height - 4) + 2; // lower rank → higher line
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <svg width={width} height={height} role="img" aria-label="Last snapshots trend">
+      <polyline points={coords} fill="none" stroke="currentColor" strokeWidth={1.5} opacity={0.7} />
+    </svg>
+  );
 }
 
 export default async function RankingsPage(): Promise<JSX.Element> {
-  const session = await getServerSession();
-  const userId = session?.user?.id;
+  const user = await getSessionUser();
+  const userId = user?.id;
 
   if (!userId) {
     return (
@@ -55,45 +85,37 @@ export default async function RankingsPage(): Promise<JSX.Element> {
     const locationTitle = (locationRes.rows[0].title as string | null) ?? "Your location";
 
     const rowsRes = await client.query(
-      `WITH latest AS (
-         SELECT DISTINCT ON (s.keyword_id)
-           s.keyword_id, s.rank, s.city, s.snapshot_date, s.provider_status, s.captured_at
+      `WITH ranked AS (
+         SELECT s.keyword_id, s.rank, s.city, s.snapshot_date, s.provider_status, s.captured_at,
+                ROW_NUMBER() OVER (PARTITION BY s.keyword_id ORDER BY s.captured_at DESC) AS rn
          FROM gbp_rank_snapshots s
          JOIN gbp_keywords k ON k.id = s.keyword_id
          WHERE k.location_id = $1
-         ORDER BY s.keyword_id, s.captured_at DESC
        ),
-       prev AS (
-         SELECT x.keyword_id, x.rank
-         FROM (
-           SELECT s.keyword_id, s.rank,
-             ROW_NUMBER() OVER (PARTITION BY s.keyword_id ORDER BY s.captured_at DESC) AS rn
-           FROM gbp_rank_snapshots s
-           JOIN gbp_keywords k ON k.id = s.keyword_id
-           WHERE k.location_id = $1
-         ) x
-         WHERE x.rn = 2
+       latest AS (
+         SELECT keyword_id, provider_status FROM ranked WHERE rn = 1
+       ),
+       good AS (
+         SELECT keyword_id, rank, city, snapshot_date, captured_at,
+                ROW_NUMBER() OVER (PARTITION BY keyword_id ORDER BY captured_at DESC) AS grn
+         FROM ranked
+         WHERE rank IS NOT NULL
        ),
        history AS (
-         SELECT y.keyword_id,
-                array_agg(y.rank ORDER BY y.captured_at DESC) AS ranks
-         FROM (
-           SELECT s.keyword_id, s.rank, s.captured_at,
-             ROW_NUMBER() OVER (PARTITION BY s.keyword_id ORDER BY s.captured_at DESC) AS rn
-           FROM gbp_rank_snapshots s
-           JOIN gbp_keywords k ON k.id = s.keyword_id
-           WHERE k.location_id = $1
-         ) y
-         WHERE y.rn <= 3
-         GROUP BY y.keyword_id
+         SELECT keyword_id, array_agg(rank ORDER BY captured_at DESC) AS ranks
+         FROM ranked
+         WHERE rn <= 3
+         GROUP BY keyword_id
        )
        SELECT k.id AS keyword_id, k.keyword,
-              l.city, l.snapshot_date::text, l.rank, l.provider_status,
+              g1.city, g1.snapshot_date::text AS snapshot_date, g1.rank,
+              l.provider_status,
               COALESCE(h.ranks, ARRAY[]::integer[]) AS history,
-              p.rank AS prev_rank
+              g2.rank AS prev_rank
        FROM gbp_keywords k
        LEFT JOIN latest l ON l.keyword_id = k.id
-       LEFT JOIN prev p ON p.keyword_id = k.id
+       LEFT JOIN good g1 ON g1.keyword_id = k.id AND g1.grn = 1
+       LEFT JOIN good g2 ON g2.keyword_id = k.id AND g2.grn = 2
        LEFT JOIN history h ON h.keyword_id = k.id
        WHERE k.location_id = $1
        ORDER BY k.created_at ASC
@@ -101,7 +123,7 @@ export default async function RankingsPage(): Promise<JSX.Element> {
       [locationId],
     );
 
-    const hasKeywords = rowsRes.rowCount > 0;
+    const hasKeywords = rowsRes.rows.length > 0;
 
     return (
       <main>
@@ -110,9 +132,16 @@ export default async function RankingsPage(): Promise<JSX.Element> {
 
         {!hasKeywords ? (
           <div className="empty">
-            <p>First snapshot runs tonight. Start by seeding suggested keywords.</p>
+            <p style={{ fontSize: "2.5rem", margin: 0 }} aria-hidden>
+              📍
+            </p>
+            <p>
+              First snapshot runs tonight. Seed up to 20 suggested keywords from your
+              categories and service-area cities — confirm or swap them, and we&apos;ll
+              track their local-pack position from your service area.
+            </p>
             <form action={async () => { "use server"; await seedKeywordsAction(locationId); }}>
-              <button type="submit">Seed keywords</button>
+              <button type="submit">Seed suggested keywords</button>
             </form>
           </div>
         ) : (
@@ -122,16 +151,24 @@ export default async function RankingsPage(): Promise<JSX.Element> {
               const prev = row.prev_rank;
               const delta = deltaChip(row.rank, prev);
               const delayed = row.provider_status === "delayed";
+              // history is newest-first from SQL; reverse for an oldest→newest sparkline.
+              const trend = [...row.history].reverse();
               return (
                 <article key={row.keyword_id} className="card">
                   <h3>{row.keyword}</h3>
                   <p className="muted">
-                    Snapshot {row.snapshot_date ?? "pending"} · {row.city ?? "local area"}{" "}
-                    {delayed ? "· rankings delayed" : ""}
+                    Snapshot {row.snapshot_date ?? "pending"} · {row.city ?? "local area"}
+                    {delayed ? " · rankings delayed" : ""}
                   </p>
-                  <p style={{ fontSize: "2rem", margin: 0 }}>{row.rank ?? "—"}</p>
-                  <p className="muted">{delta}</p>
-                  <p className="muted">Last 3: {row.history.map((x) => (x ?? "—")).join(" · ")}</p>
+                  <p style={{ fontSize: "2.5rem", fontWeight: 700, margin: "0.25rem 0" }}>
+                    {row.rank ?? "—"}
+                  </p>
+                  <p style={{ margin: "0.25rem 0", color: delta.color, fontWeight: 600 }}>
+                    {delta.label}
+                  </p>
+                  {sparkline(trend) ?? (
+                    <p className="muted">Last 3: {row.history.map((x) => x ?? "—").join(" · ")}</p>
+                  )}
                 </article>
               );
             })}
