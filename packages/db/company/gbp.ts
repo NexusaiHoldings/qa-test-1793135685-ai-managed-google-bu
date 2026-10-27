@@ -271,28 +271,24 @@ ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS risk_reasons      jsonb NOT NUL
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS classified_at     timestamptz;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_reply       text;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_response_id uuid;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS content_check_id  uuid;
--- reply_status: pending | auto_queued | awaiting_owner | with_team | published | blocked
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS reply_status      text NOT NULL DEFAULT 'pending';
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS drafted_at        timestamptz;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_generated_at timestamptz;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_model       text;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS claims_verdict    text;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS claims_checked_at timestamptz;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS publish_state     text NOT NULL DEFAULT 'pending';
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS publish_error     text;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS published_at      timestamptz;
-CREATE INDEX IF NOT EXISTS idx_gbp_reviews_reply_status ON gbp_reviews (location_id, reply_status);
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approved_by       uuid;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approved_at       timestamptz;
+CREATE INDEX IF NOT EXISTS idx_gbp_reviews_publish_state ON gbp_reviews (location_id, publish_state);
 
--- 17. Review escalations (human_review-tier reviews routed to the team + a
--- @nexus/support-and-help ticket). Distinct from the F1-002 backfill table — this
--- is the live escalation record the /reviews feed reads to show "With our team".
-CREATE TABLE IF NOT EXISTS gbp_escalations (
-  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  review_id          uuid NOT NULL,
-  location_id        uuid NOT NULL,
-  tier               text NOT NULL DEFAULT 'human_review',
-  reason             text,
-  reasons            jsonb NOT NULL DEFAULT '[]'::jsonb,
-  support_ticket_id  uuid,
-  status             text NOT NULL DEFAULT 'open',
-  created_at         timestamptz NOT NULL DEFAULT now(),
-  resolved_at        timestamptz,
-  CONSTRAINT gbp_escalations_unique UNIQUE (review_id)
-);
-CREATE INDEX IF NOT EXISTS idx_gbp_escalations_location ON gbp_escalations (location_id, status);
+-- ── Rank tracker additions (Feature F1-008) ────────────────────────────────────
+ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS city            text;
+ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS city_latitude   numeric(10,7);
+ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS city_longitude  numeric(10,7);
+ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS check_date      date;
+ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS delayed         boolean NOT NULL DEFAULT false;
+ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS error_code      text;
+CREATE INDEX IF NOT EXISTS idx_gbp_rank_snapshots_keyword_date
+  ON gbp_rank_snapshots (keyword_id, captured_at DESC);
 `;
