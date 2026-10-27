@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS gbp_voice_profiles (
   tone_summary        text,
   profile             jsonb NOT NULL DEFAULT '{}'::jsonb,
   seeded_from_reviews boolean NOT NULL DEFAULT false,
+  approved            boolean NOT NULL DEFAULT false,
+  approved_at         timestamptz,
   created_at          timestamptz NOT NULL DEFAULT now(),
   updated_at          timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT gbp_voice_profiles_unique UNIQUE (location_id)
