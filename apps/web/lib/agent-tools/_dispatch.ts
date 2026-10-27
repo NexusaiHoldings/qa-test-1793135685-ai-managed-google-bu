@@ -39,4 +39,3 @@ export const DOMAIN_DISPATCH: Record<
   publish_gbp_post: (ctx, a) => handlePublishGbpPost(ctx, a),
   pause_location_automation: (ctx, a) => handlePauseLocationAutomation(ctx, a),
 };
-
