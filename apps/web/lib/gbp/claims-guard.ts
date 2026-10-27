@@ -1,10 +1,14 @@
-import { sql } from "@repo/db";
+import { Pool } from "pg";
 import {
-  ClaimsContentKind,
-  FlaggedClaim,
+  type ClaimsContentKind,
+  type FlaggedClaim,
   detectFlaggedClaims,
   getClaimsRulesForState,
 } from "@/lib/gbp/claims-rules";
+
+// Shared pooled connection — matches the pg convention used across lib/gbp/*
+// (voice-profile.ts, review-sync.ts). Raw parameterized SQL, no ORM.
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 export type ClaimsVerdict = "pass" | "blocked";
 
@@ -62,18 +66,36 @@ async function gatewayRewrite(
   return { rewrittenText: deterministic };
 }
 
-async function getLocationState(locationId: string): Promise<string | null> {
-  const rows = await sql<{ storefront_address: unknown; service_areas: unknown }[]>`
-    SELECT storefront_address, service_areas
-    FROM gbp_locations
-    WHERE id = ${locationId}::uuid
-    LIMIT 1
-  `;
+interface LocationStateRow {
+  state: string | null;
+  storefront_address: Record<string, unknown> | null;
+  service_areas: unknown;
+}
 
-  const row = rows[0];
+/**
+ * Resolve the location's state code so the per-state rule set applies
+ * (ceo_briefing: state trade-licensing advertising requirements can be
+ * tightened per state without code changes). Prefers the denormalized
+ * gbp_locations.state column, falling back to the structured address /
+ * service-area region code when state has not been backfilled yet.
+ */
+async function getLocationState(locationId: string): Promise<string | null> {
+  const rows = await pool.query<LocationStateRow>(
+    `SELECT state, storefront_address, service_areas
+       FROM gbp_locations
+      WHERE id = $1::uuid
+      LIMIT 1`,
+    [locationId],
+  );
+
+  const row = rows.rows[0];
   if (!row) return null;
 
-  const address = (row.storefront_address as Record<string, unknown> | null) ?? null;
+  if (typeof row.state === "string" && row.state.trim()) {
+    return row.state;
+  }
+
+  const address = row.storefront_address ?? null;
   if (address && typeof address.administrativeArea === "string") {
     return address.administrativeArea;
   }
@@ -110,36 +132,45 @@ export async function runClaimsGuard(input: ClaimsGuardInput): Promise<ClaimsGua
       ? "pass"
       : "blocked";
 
-  const inserted = await sql<{ id: string }[]>`
-    INSERT INTO gbp_content_checks (
-      location_id,
-      subject_type,
-      subject_id,
+  const strippedJson = JSON.stringify(strippedClaims);
+  const inserted = await pool.query<{ id: string }>(
+    `INSERT INTO gbp_content_checks (
+       location_id,
+       subject_type,
+       subject_id,
+       verdict,
+       findings,
+       content_kind,
+       content_ref,
+       stripped_claims,
+       rewritten_text
+     )
+     VALUES (
+       $1::uuid,
+       'claims_guard',
+       $2::uuid,
+       $3,
+       $4::jsonb,
+       $5,
+       $2::uuid,
+       $4::jsonb,
+       $6
+     )
+     RETURNING id`,
+    [
+      input.locationId,
+      input.contentRef,
       verdict,
-      findings,
-      content_kind,
-      content_ref,
-      stripped_claims,
-      rewritten_text
-    )
-    VALUES (
-      ${input.locationId}::uuid,
-      'claims_guard',
-      ${input.contentRef ? sql`${input.contentRef}::uuid` : sql`NULL`},
-      ${verdict},
-      ${JSON.stringify(strippedClaims)}::jsonb,
-      ${input.contentKind},
-      ${input.contentRef ? sql`${input.contentRef}::uuid` : sql`NULL`},
-      ${JSON.stringify(strippedClaims)}::jsonb,
-      ${rewritten.rewrittenText}
-    )
-    RETURNING id
-  `;
+      strippedJson,
+      input.contentKind,
+      rewritten.rewrittenText,
+    ],
+  );
 
   return {
     verdict,
     strippedClaims,
     rewrittenText: rewritten.rewrittenText,
-    contentCheckId: inserted[0].id,
+    contentCheckId: inserted.rows[0].id,
   };
 }
