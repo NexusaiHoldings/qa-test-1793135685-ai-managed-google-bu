@@ -1,129 +1,145 @@
 import { Pool } from "pg";
-import { seedKeywordsAction, saveKeywordsAction } from "./actions";
+import { getServerSession } from "@nexus/identity-and-access";
+import { seedKeywordsAction } from "./actions";
 
-const db = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 type Row = {
   keyword_id: string;
   keyword: string;
   city: string | null;
-  captured_at: string | null;
+  snapshot_date: string | null;
   rank: number | null;
-  found: boolean | null;
-  delayed: boolean | null;
-  prev_rank: number | null;
-  prev_prev_rank: number | null;
+  provider_status: string | null;
+  history: Array<number | null>;
 };
 
-function deltaLabel(rank: number | null, prev: number | null): string {
-  if (rank == null || prev == null) return "—";
-  const d = prev - rank;
-  if (d > 0) return `▲${d}`;
-  if (d < 0) return `▼${Math.abs(d)}`;
+function deltaChip(curr: number | null, prev: number | null): string {
+  if (curr === null || prev === null) return "—";
+  const delta = prev - curr;
+  if (delta > 0) return `▲${delta}`;
+  if (delta < 0) return `▼${Math.abs(delta)}`;
   return "—";
 }
 
 export default async function RankingsPage(): Promise<JSX.Element> {
-  const locRes = await db.query<{ id: string; title: string }>(
-    `SELECT id, COALESCE(title, 'Your location') AS title FROM gbp_locations ORDER BY linked_at ASC LIMIT 1`,
-  );
+  const session = await getServerSession();
+  const userId = session?.user?.id;
 
-  if (locRes.rowCount === 0) {
+  if (!userId) {
     return (
       <main>
         <h1>Rankings</h1>
-        <p>Connect your Google Business Profile first to start local keyword tracking.</p>
-        <div className="empty">No location found.</div>
+        <p>Please sign in to view local keyword rankings.</p>
       </main>
     );
   }
 
-  const location = locRes.rows[0];
-  const data = await db.query<Row>(
-    `
-    SELECT
-      k.id AS keyword_id,
-      k.keyword,
-      s.city,
-      s.captured_at::text,
-      s.rank,
-      s.found,
-      s.delayed,
-      (
-        SELECT s2.rank
-        FROM gbp_rank_snapshots s2
-        WHERE s2.keyword_id = k.id
-        ORDER BY s2.captured_at DESC
-        OFFSET 1 LIMIT 1
-      ) AS prev_rank,
-      (
-        SELECT s3.rank
-        FROM gbp_rank_snapshots s3
-        WHERE s3.keyword_id = k.id
-        ORDER BY s3.captured_at DESC
-        OFFSET 2 LIMIT 1
-      ) AS prev_prev_rank
-    FROM gbp_keywords k
-    LEFT JOIN LATERAL (
-      SELECT city, captured_at, rank, found, delayed
-      FROM gbp_rank_snapshots s
-      WHERE s.keyword_id = k.id
-      ORDER BY s.captured_at DESC
-      LIMIT 1
-    ) s ON true
-    WHERE k.location_id = $1
-    ORDER BY k.created_at ASC
-    `,
-    [location.id],
-  );
+  const client = await pool.connect();
+  try {
+    const locationRes = await client.query(
+      `SELECT id, title FROM gbp_locations WHERE user_id = $1 ORDER BY linked_at DESC LIMIT 1`,
+      [userId],
+    );
 
-  const keywordsText = data.rows.map((r) => r.keyword).join("\n");
-  const hasSnapshots = data.rows.some((r) => r.captured_at);
+    if (locationRes.rowCount === 0) {
+      return (
+        <main>
+          <h1>Rankings</h1>
+          <p>Connect a Google Business Profile location first.</p>
+        </main>
+      );
+    }
 
-  return (
-    <main>
-      <h1>Local rankings</h1>
-      <p>Track up to 20 service-area keywords from your target city centroid.</p>
+    const locationId = locationRes.rows[0].id as string;
+    const locationTitle = (locationRes.rows[0].title as string | null) ?? "Your location";
 
-      <section className="card">
-        <h2>{location.title}</h2>
-        <form action={seedKeywordsAction}>
-          <input type="hidden" name="locationId" value={location.id} />
-          <button type="submit">Seed keyword suggestions</button>
-        </form>
-        <form action={saveKeywordsAction}>
-          <input type="hidden" name="locationId" value={location.id} />
-          <label htmlFor="keywords">Keywords (one per line, max 20)</label>
-          <textarea id="keywords" name="keywords" defaultValue={keywordsText} rows={8} />
-          <button type="submit">Save keywords</button>
-        </form>
-      </section>
+    const rowsRes = await client.query(
+      `WITH latest AS (
+         SELECT DISTINCT ON (s.keyword_id)
+           s.keyword_id, s.rank, s.city, s.snapshot_date, s.provider_status, s.captured_at
+         FROM gbp_rank_snapshots s
+         JOIN gbp_keywords k ON k.id = s.keyword_id
+         WHERE k.location_id = $1
+         ORDER BY s.keyword_id, s.captured_at DESC
+       ),
+       prev AS (
+         SELECT x.keyword_id, x.rank
+         FROM (
+           SELECT s.keyword_id, s.rank,
+             ROW_NUMBER() OVER (PARTITION BY s.keyword_id ORDER BY s.captured_at DESC) AS rn
+           FROM gbp_rank_snapshots s
+           JOIN gbp_keywords k ON k.id = s.keyword_id
+           WHERE k.location_id = $1
+         ) x
+         WHERE x.rn = 2
+       ),
+       history AS (
+         SELECT y.keyword_id,
+                array_agg(y.rank ORDER BY y.captured_at DESC) AS ranks
+         FROM (
+           SELECT s.keyword_id, s.rank, s.captured_at,
+             ROW_NUMBER() OVER (PARTITION BY s.keyword_id ORDER BY s.captured_at DESC) AS rn
+           FROM gbp_rank_snapshots s
+           JOIN gbp_keywords k ON k.id = s.keyword_id
+           WHERE k.location_id = $1
+         ) y
+         WHERE y.rn <= 3
+         GROUP BY y.keyword_id
+       )
+       SELECT k.id AS keyword_id, k.keyword,
+              l.city, l.snapshot_date::text, l.rank, l.provider_status,
+              COALESCE(h.ranks, ARRAY[]::integer[]) AS history,
+              p.rank AS prev_rank
+       FROM gbp_keywords k
+       LEFT JOIN latest l ON l.keyword_id = k.id
+       LEFT JOIN prev p ON p.keyword_id = k.id
+       LEFT JOIN history h ON h.keyword_id = k.id
+       WHERE k.location_id = $1
+       ORDER BY k.created_at ASC
+       LIMIT 20`,
+      [locationId],
+    );
 
-      {!hasSnapshots ? (
-        <div className="empty">
-          <p>First snapshot runs tonight.</p>
-        </div>
-      ) : (
-        <section>
-          {data.rows.map((r) => {
-            const delta = deltaLabel(r.rank, r.prev_rank);
-            return (
-              <article className="card" key={r.keyword_id}>
-                <h3>{r.keyword}</h3>
-                <p className="muted">
-                  Snapshot: {r.captured_at ? new Date(r.captured_at).toLocaleDateString() : "—"} · City:{" "}
-                  {r.city ?? "—"} {r.delayed ? "· rankings delayed" : ""}
-                </p>
-                <p style={{ fontSize: "2rem", margin: 0 }}>{r.rank ?? "—"}</p>
-                <p>{delta}</p>
-                <p className="muted">
-                  Trend: {r.prev_prev_rank ?? "—"} → {r.prev_rank ?? "—"} → {r.rank ?? "—"}
-                </p>
-              </article>
-            );
-          })}
-        </section>
-      )}
-    </main>
-  );
+    const hasKeywords = rowsRes.rowCount > 0;
+
+    return (
+      <main>
+        <h1>Rankings</h1>
+        <p>{locationTitle}: local-pack keyword tracking for service-area cities.</p>
+
+        {!hasKeywords ? (
+          <div className="empty">
+            <p>First snapshot runs tonight. Start by seeding suggested keywords.</p>
+            <form action={async () => { "use server"; await seedKeywordsAction(locationId); }}>
+              <button type="submit">Seed keywords</button>
+            </form>
+          </div>
+        ) : (
+          <section>
+            {rowsRes.rows.map((r) => {
+              const row = r as Row & { prev_rank: number | null };
+              const prev = row.prev_rank;
+              const delta = deltaChip(row.rank, prev);
+              const delayed = row.provider_status === "delayed";
+              return (
+                <article key={row.keyword_id} className="card">
+                  <h3>{row.keyword}</h3>
+                  <p className="muted">
+                    Snapshot {row.snapshot_date ?? "pending"} · {row.city ?? "local area"}{" "}
+                    {delayed ? "· rankings delayed" : ""}
+                  </p>
+                  <p style={{ fontSize: "2rem", margin: 0 }}>{row.rank ?? "—"}</p>
+                  <p className="muted">{delta}</p>
+                  <p className="muted">Last 3: {row.history.map((x) => (x ?? "—")).join(" · ")}</p>
+                </article>
+              );
+            })}
+          </section>
+        )}
+      </main>
+    );
+  } finally {
+    client.release();
+  }
 }

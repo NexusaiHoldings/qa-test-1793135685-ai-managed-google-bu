@@ -1,37 +1,50 @@
 "use server";
 
 import { Pool } from "pg";
-import { ensureSeededKeywords } from "@/lib/gbp/keywords";
-import { revalidatePath } from "next/cache";
+import { getServerSession } from "@nexus/identity-and-access";
+import { suggestKeywords } from "@/lib/gbp/keywords";
 
-const db = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-export async function saveKeywordsAction(formData: FormData): Promise<void> {
-  const locationId = String(formData.get("locationId") ?? "");
-  const raw = String(formData.get("keywords") ?? "");
-  if (!locationId) return;
+export async function seedKeywordsAction(locationId: string): Promise<{ seeded: number }> {
+  const session = await getServerSession();
+  const userId = session?.user?.id;
+  if (!userId) return { seeded: 0 };
 
-  const keywords = raw
-    .split("\n")
-    .map((k) => k.trim())
-    .filter(Boolean)
-    .slice(0, 20);
-
-  await db.query(`DELETE FROM gbp_keywords WHERE location_id = $1`, [locationId]);
-  for (const keyword of keywords) {
-    await db.query(
-      `INSERT INTO gbp_keywords (location_id, keyword, locale) VALUES ($1, $2, $3)
-       ON CONFLICT (location_id, keyword) DO NOTHING`,
-      [locationId, keyword, "en-US"],
+  const client = await pool.connect();
+  try {
+    const locationRes = await client.query(
+      `SELECT primary_category, additional_categories, service_areas
+       FROM gbp_locations
+       WHERE id = $1 AND user_id = $2`,
+      [locationId, userId],
     );
+
+    if (locationRes.rowCount === 0) return { seeded: 0 };
+
+    const row = locationRes.rows[0] as {
+      primary_category: string | null;
+      additional_categories: unknown;
+      service_areas: unknown;
+    };
+
+    const additional = Array.isArray(row.additional_categories) ? row.additional_categories.map(String) : [];
+    const areas = Array.isArray(row.service_areas) ? row.service_areas.map(String) : [];
+    const keywords = suggestKeywords(row.primary_category, additional, areas);
+
+    let seeded = 0;
+    for (const keyword of keywords) {
+      const result = await client.query(
+        `INSERT INTO gbp_keywords (location_id, keyword, locale)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (location_id, keyword) DO NOTHING`,
+        [locationId, keyword, "en-US"],
+      );
+      seeded += result.rowCount ?? 0;
+    }
+
+    return { seeded };
+  } finally {
+    client.release();
   }
-
-  revalidatePath("/rankings");
-}
-
-export async function seedKeywordsAction(formData: FormData): Promise<void> {
-  const locationId = String(formData.get("locationId") ?? "");
-  if (!locationId) return;
-  await ensureSeededKeywords(db, locationId);
-  revalidatePath("/rankings");
 }

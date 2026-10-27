@@ -274,21 +274,21 @@ ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_response_id uuid;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_generated_at timestamptz;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS draft_model       text;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS claims_verdict    text;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS claims_checked_at timestamptz;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS publish_state     text NOT NULL DEFAULT 'pending';
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS publish_error     text;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS claims_findings   jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS route_status      text NOT NULL DEFAULT 'pending';
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS route_reason      text;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS published_response_id uuid;
 ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS published_at      timestamptz;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approved_by       uuid;
-ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS approved_at       timestamptz;
-CREATE INDEX IF NOT EXISTS idx_gbp_reviews_publish_state ON gbp_reviews (location_id, publish_state);
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS failed_at         timestamptz;
+ALTER TABLE gbp_reviews ADD COLUMN IF NOT EXISTS failure_reason    text;
 
--- ── Rank tracker additions (Feature F1-008) ────────────────────────────────────
-ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS city            text;
-ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS city_latitude   numeric(10,7);
-ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS city_longitude  numeric(10,7);
-ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS check_date      date;
-ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS delayed         boolean NOT NULL DEFAULT false;
-ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS error_code      text;
+CREATE INDEX IF NOT EXISTS idx_gbp_reviews_route_status
+  ON gbp_reviews (location_id, route_status, review_created_at DESC);
+
+-- ── F1-008 rank tracking polish ──────────────────────────────────────────────────
+ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS city text;
+ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS snapshot_date date;
+ALTER TABLE gbp_rank_snapshots ADD COLUMN IF NOT EXISTS provider_status text NOT NULL DEFAULT 'ok';
 CREATE INDEX IF NOT EXISTS idx_gbp_rank_snapshots_keyword_date
   ON gbp_rank_snapshots (keyword_id, captured_at DESC);
 `;
