@@ -3,103 +3,78 @@ import type { HandlerContext, HandlerResult } from "@nexus/identity-and-access";
 type Args = {
   location_id?: unknown;
   week_of?: unknown;
-  dry_run?: unknown;
+  post_id?: unknown;
 };
 
 type DbRow = {
   id: string;
   location_id: string;
   week_of: string;
-  google_location_name: string | null;
-  title: string | null;
+  status: string;
+  post_type: string | null;
   summary: string | null;
-  cta_label: string | null;
-  cta_url: string | null;
-  media_url: string | null;
-  published_at: string | null;
-  google_post_name: string | null;
+  call_to_action_type: string | null;
+  call_to_action_url: string | null;
+  media_source_url: string | null;
+  gmb_local_post_name: string | null;
 };
 
-type GoogleCreateResponse = {
-  name?: string;
-  [key: string]: unknown;
-};
-
-type Queryable = {
-  query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
-};
-
-function asQueryable(ctx: HandlerContext): Queryable {
-  const maybeDb = (ctx as unknown as { db?: Queryable; pool?: Queryable }).db
-    ?? (ctx as unknown as { db?: Queryable; pool?: Queryable }).pool;
-  if (!maybeDb || typeof maybeDb.query !== "function") {
-    throw new Error("handler_context_missing_db_query");
-  }
-  return maybeDb;
-}
-
-function normalizeIsoDate(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new Error(`invalid_${field}`);
-  }
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) {
-    throw new Error(`invalid_${field}`);
-  }
-  return d.toISOString().slice(0, 10);
-}
-
-function normalizeUuid(value: unknown, field: string): string {
-  if (typeof value !== "string") {
-    throw new Error(`invalid_${field}`);
-  }
-  const v = value.trim();
-  const uuidRe =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  if (!uuidRe.test(v)) {
-    throw new Error(`invalid_${field}`);
-  }
-  return v;
-}
-
-function toErrorResult(code: string, message: string): HandlerResult {
-  return {
-    ok: false,
-    code,
-    error: message,
-  } as unknown as HandlerResult;
-}
-
-async function resolveGoogleClient(ctx: HandlerContext): Promise<{
+type GoogleClient = {
   createLocalPost: (input: {
     locationId: string;
-    title: string;
+    languageCode?: string;
     summary: string;
-    ctaLabel?: string | null;
-    ctaUrl?: string | null;
-    mediaUrl?: string | null;
-    idempotencyKey: string;
-  }) => Promise<GoogleCreateResponse>;
-}> {
-  const dynamicImport = await import("@/lib/gbp/google-client").catch(() => null);
-  if (!dynamicImport || typeof (dynamicImport as Record<string, unknown>).createLocalPost !== "function") {
-    throw new Error("google_client_createLocalPost_missing");
-  }
-  const createLocalPost = (dynamicImport as {
-    createLocalPost: (ctx: HandlerContext, input: {
-      locationId: string;
-      title: string;
-      summary: string;
-      ctaLabel?: string | null;
-      ctaUrl?: string | null;
-      mediaUrl?: string | null;
-      idempotencyKey: string;
-    }) => Promise<GoogleCreateResponse>;
-  }).createLocalPost;
+    callToAction?: { actionType: string; url?: string };
+    media?: { sourceUrl: string };
+    event?: Record<string, unknown>;
+  }) => Promise<{ name?: string }>;
+};
 
-  return {
-    createLocalPost: async (input) => createLocalPost(ctx, input),
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+async function getDb(ctx: HandlerContext): Promise<{
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+}> {
+  const candidate = (ctx as unknown as { db?: unknown }).db;
+  if (
+    isRecord(candidate) &&
+    typeof candidate.query === "function"
+  ) {
+    return candidate as {
+      query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+    };
+  }
+
+  const dynamicImport = new Function("m", "return import(m)") as (m: string) => Promise<unknown>;
+  const pgMod = await dynamicImport("pg");
+  const PoolCtor = (pgMod as { Pool?: new (cfg: { connectionString?: string }) => unknown }).Pool;
+  if (!PoolCtor) {
+    throw new Error("pg Pool unavailable");
+  }
+  const pool = new PoolCtor({ connectionString: process.env.DATABASE_URL });
+  return pool as {
+    query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
   };
+}
+
+async function getGoogleClient(ctx: HandlerContext): Promise<GoogleClient> {
+  const candidate = (ctx as unknown as { googleClient?: unknown }).googleClient;
+  if (isRecord(candidate) && typeof candidate.createLocalPost === "function") {
+    return candidate as GoogleClient;
+  }
+  const dynamicImport = new Function("m", "return import(m)") as (m: string) => Promise<unknown>;
+  const mod = await dynamicImport("@/lib/gbp/google-client");
+  const createGoogleClient = (mod as { createGoogleClient?: () => Promise<GoogleClient> }).createGoogleClient;
+  if (!createGoogleClient) {
+    throw new Error("google client factory unavailable");
+  }
+  return createGoogleClient();
 }
 
 export async function handlePublishGbpPost(
@@ -107,115 +82,113 @@ export async function handlePublishGbpPost(
   args: Args,
 ): Promise<HandlerResult> {
   try {
-    const locationId = normalizeUuid(args.location_id, "location_id");
-    const weekOf = normalizeIsoDate(args.week_of, "week_of");
-    const dryRun = Boolean(args.dry_run);
+    const locationId = asString(args.location_id);
+    const weekOf = asString(args.week_of);
+    const postId = asString(args.post_id);
 
-    const db = asQueryable(ctx);
+    if (!locationId && !postId) {
+      return {
+        ok: false,
+        error: "invalid_args",
+        message: "Expected location_id + week_of or post_id.",
+      };
+    }
 
-    const selected = await db.query(
-      `
-      SELECT
-        p.id,
-        p.location_id,
-        p.week_of::text AS week_of,
-        p.google_location_name,
-        p.title,
-        p.summary,
-        p.cta_label,
-        p.cta_url,
-        p.media_url,
-        p.published_at::text AS published_at,
-        p.google_post_name
-      FROM gbp_posts p
-      WHERE p.location_id = $1
-        AND p.week_of = $2::date
+    const db = await getDb(ctx);
+    const params: unknown[] = [];
+    let whereClause = "";
+    if (postId) {
+      params.push(postId);
+      whereClause = `id = $${params.length}`;
+    } else {
+      params.push(locationId, weekOf);
+      whereClause = `location_id = $1 AND week_of = $2`;
+    }
+
+    const selectSql = `
+      SELECT id, location_id, week_of, status, post_type, summary,
+             call_to_action_type, call_to_action_url, media_source_url,
+             gmb_local_post_name
+      FROM gbp_posts
+      WHERE ${whereClause}
+      ORDER BY created_at DESC
       LIMIT 1
-      `,
-      [locationId, weekOf],
-    );
+    `;
+    const selected = await db.query(selectSql, params);
+    const row = (selected.rows[0] ?? null) as DbRow | null;
 
-    if (selected.rows.length === 0) {
-      return toErrorResult("not_found", "No scheduled GBP post for location/week");
+    if (!row) {
+      return {
+        ok: false,
+        error: "not_found",
+        message: "No matching GBP post draft found.",
+      };
     }
 
-    const row = selected.rows[0] as DbRow;
-
-    if (row.published_at || row.google_post_name) {
+    if (row.status === "published" && row.gmb_local_post_name) {
       return {
         ok: true,
         data: {
-          status: "already_published",
+          id: row.id,
           location_id: row.location_id,
           week_of: row.week_of,
-          post_id: row.id,
-          google_post_name: row.google_post_name ?? null,
+          status: row.status,
+          gmb_local_post_name: row.gmb_local_post_name,
+          idempotent: true,
         },
-      } as unknown as HandlerResult;
+      };
     }
 
-    if (!row.title || !row.summary) {
-      return toErrorResult("invalid_state", "Post missing title or summary");
-    }
-
-    const idempotencyKey = `gbp-post:${row.location_id}:${row.week_of}`;
-
-    if (dryRun) {
+    if (!row.summary || row.summary.trim().length === 0) {
       return {
-        ok: true,
-        data: {
-          status: "dry_run",
-          post_id: row.id,
-          location_id: row.location_id,
-          week_of: row.week_of,
-          idempotency_key: idempotencyKey,
-        },
-      } as unknown as HandlerResult;
+        ok: false,
+        error: "invalid_state",
+        message: "Draft summary is empty.",
+      };
     }
 
-    const googleClient = await resolveGoogleClient(ctx);
-    const created = await googleClient.createLocalPost({
+    const google = await getGoogleClient(ctx);
+    const created = await google.createLocalPost({
       locationId: row.location_id,
-      title: row.title,
       summary: row.summary,
-      ctaLabel: row.cta_label,
-      ctaUrl: row.cta_url,
-      mediaUrl: row.media_url,
-      idempotencyKey,
+      callToAction: row.call_to_action_type
+        ? {
+            actionType: row.call_to_action_type,
+            url: row.call_to_action_url ?? undefined,
+          }
+        : undefined,
+      media: row.media_source_url ? { sourceUrl: row.media_source_url } : undefined,
     });
 
-    const googlePostName =
-      typeof created.name === "string" && created.name.trim().length > 0
-        ? created.name.trim()
-        : null;
-
+    const gmbName = typeof created.name === "string" ? created.name : null;
     await db.query(
       `
       UPDATE gbp_posts
-      SET
-        published_at = NOW(),
-        google_post_name = COALESCE($3, google_post_name),
-        updated_at = NOW()
-      WHERE location_id = $1
-        AND week_of = $2::date
+      SET status = 'published',
+          published_at = NOW(),
+          gmb_local_post_name = COALESCE($2, gmb_local_post_name),
+          updated_at = NOW()
+      WHERE id = $1
       `,
-      [row.location_id, row.week_of, googlePostName],
+      [row.id, gmbName],
     );
 
     return {
       ok: true,
       data: {
-        status: "published",
-        post_id: row.id,
+        id: row.id,
         location_id: row.location_id,
         week_of: row.week_of,
-        google_post_name: googlePostName,
-        idempotency_key: idempotencyKey,
+        status: "published",
+        gmb_local_post_name: gmbName,
+        idempotent: false,
       },
-    } as unknown as HandlerResult;
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "publish_gbp_post_failed";
-    return toErrorResult("publish_gbp_post_failed", message);
+    };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      error: "publish_failed",
+      message: error instanceof Error ? error.message : "Unknown error",
+    };
   }
 }
