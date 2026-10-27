@@ -1,16 +1,36 @@
-import { NextResponse } from "next/server";
-import { Pool } from "pg";
-import { getAdminUser, writeAdminAuditLog } from "@nexus/admin-console";
+/**
+ * Escalation console API (Feature F1-010).
+ *
+ * GET  — list gbp_review_escalations (open first) with the review, the agent's
+ *        rationale, the drafted reply, and any prior operator action.
+ * POST — apply an operator action: approve-as-is, edit-and-publish,
+ *        reply-manually-offline, or mark-dismissed. Every action is written to
+ *        the admin-console `admin_audit_log`.
+ *
+ * Auth: getAdminUser() is called FIRST and a 403 is returned before the request
+ * body is parsed or the DB is touched (per objective). Non-admins never reach
+ * the query layer.
+ */
 
-type EscalationAction =
-  | "approve_as_is"
-  | "edit_and_publish"
-  | "reply_manually_offline"
-  | "mark_dismissed";
+import { NextResponse } from "next/server";
+import { getAdminUser } from "@/lib/admin-auth";
+import { buildDb } from "@/lib/db";
+
+export const dynamic = "force-dynamic";
+
+const ESCALATION_ACTIONS = [
+  "approve_as_is",
+  "edit_and_publish",
+  "reply_manually_offline",
+  "mark_dismissed",
+] as const;
+type EscalationAction = (typeof ESCALATION_ACTIONS)[number];
+
+const AUDIT_FALLBACK_ACTOR = "00000000-0000-0000-0000-000000000000";
 
 type ActionBody = {
-  escalationId: string;
-  action: EscalationAction;
+  escalationId?: string;
+  action?: string;
   editedReply?: string;
   note?: string;
 };
@@ -22,26 +42,23 @@ type EscalationRow = {
   reason: string | null;
   risk_level: string;
   status: string;
-  created_at: Date;
+  created_at: Date | string;
   agent_rationale: string | null;
   drafted_reply: string | null;
   edited_reply: string | null;
   action: string | null;
   action_note: string | null;
-  acted_at: Date | null;
+  acted_at: Date | string | null;
+  external_reply_posted: boolean;
   title: string | null;
   reviewer_name: string | null;
   star_rating: number | null;
   comment: string | null;
 };
 
-let pool: Pool | null = null;
-function getPool(): Pool {
-  if (pool) return pool;
-  const connectionString: string | undefined = process.env.DATABASE_URL;
-  if (!connectionString) throw new Error("DATABASE_URL is required");
-  pool = new Pool({ connectionString });
-  return pool;
+function toIso(value: Date | string | null): string | null {
+  if (value === null || value === undefined) return null;
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
 
 export async function GET(): Promise<NextResponse> {
@@ -50,11 +67,12 @@ export async function GET(): Promise<NextResponse> {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
 
-  const db = getPool();
-  const sql = `
+  const db = buildDb();
+  const rows = await db.query<EscalationRow>(`
     SELECT
       e.id, e.review_id, e.location_id, e.reason, e.risk_level, e.status, e.created_at,
-      e.agent_rationale, e.drafted_reply, e.edited_reply, e.action, e.action_note, e.acted_at,
+      e.agent_rationale, e.drafted_reply, e.edited_reply, e.action, e.action_note,
+      e.acted_at, e.external_reply_posted,
       l.title, r.reviewer_name, r.star_rating, r.comment
     FROM gbp_review_escalations e
     LEFT JOIN gbp_locations l ON l.id = e.location_id
@@ -63,11 +81,10 @@ export async function GET(): Promise<NextResponse> {
       CASE e.status WHEN 'open' THEN 0 ELSE 1 END,
       e.created_at DESC
     LIMIT 200
-  `;
-  const result = await db.query<EscalationRow>(sql);
+  `);
 
   return NextResponse.json({
-    escalations: result.rows.map((r) => ({
+    escalations: rows.map((r) => ({
       id: r.id,
       reviewId: r.review_id,
       locationId: r.location_id,
@@ -75,13 +92,14 @@ export async function GET(): Promise<NextResponse> {
       reason: r.reason,
       riskLevel: r.risk_level,
       status: r.status,
-      createdAt: r.created_at.toISOString(),
+      createdAt: toIso(r.created_at),
       agentRationale: r.agent_rationale,
       draftedReply: r.drafted_reply,
       editedReply: r.edited_reply,
       action: r.action,
       actionNote: r.action_note,
-      actedAt: r.acted_at ? r.acted_at.toISOString() : null,
+      actedAt: toIso(r.acted_at),
+      externalReplyPosted: r.external_reply_posted,
       reviewerName: r.reviewer_name,
       starRating: r.star_rating,
       comment: r.comment,
@@ -95,61 +113,68 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
 
-  const body = (await request.json()) as ActionBody;
-  if (!body?.escalationId || !body?.action) {
-    return NextResponse.json({ error: "invalid_payload" }, { status: 400 });
+  let body: ActionBody;
+  try {
+    body = (await request.json()) as ActionBody;
+  } catch {
+    return NextResponse.json({ error: "invalid_json" }, { status: 400 });
   }
 
-  const db = getPool();
-  const nextStatus =
-    body.action === "mark_dismissed" ? "dismissed" : "resolved";
+  const escalationId = (body.escalationId ?? "").trim();
+  const action = body.action as EscalationAction | undefined;
+  if (!escalationId || !action || !ESCALATION_ACTIONS.includes(action)) {
+    return NextResponse.json({ error: "invalid_payload" }, { status: 400 });
+  }
+  if (action === "edit_and_publish" && !(body.editedReply ?? "").trim()) {
+    return NextResponse.json({ error: "edited_reply_required" }, { status: 400 });
+  }
 
-  const updateSql = `
-    UPDATE gbp_review_escalations
-    SET
-      status = $2,
-      action = $3,
-      edited_reply = CASE WHEN $3 = 'edit_and_publish' THEN $4 ELSE edited_reply END,
-      action_note = $5,
-      acted_by = $6,
-      acted_at = now(),
-      external_reply_posted = CASE WHEN $3 IN ('approve_as_is','edit_and_publish') THEN true ELSE external_reply_posted END
-    WHERE id = $1
-    RETURNING id, location_id, status, action
-  `;
-  const updated = await db.query<{
-    id: string;
-    location_id: string;
-    status: string;
-    action: string;
-  }>(updateSql, [
-    body.escalationId,
+  const db = buildDb();
+  const nextStatus = action === "mark_dismissed" ? "dismissed" : "resolved";
+
+  const updated = await db.query<{ id: string; location_id: string; status: string; action: string }>(
+    `UPDATE gbp_review_escalations
+     SET status = $2,
+         action = $3,
+         edited_reply = CASE WHEN $3 = 'edit_and_publish' THEN $4 ELSE edited_reply END,
+         action_note = $5,
+         acted_by = $6,
+         acted_at = now(),
+         external_reply_posted = CASE
+           WHEN $3 IN ('approve_as_is', 'edit_and_publish') THEN true
+           ELSE external_reply_posted
+         END
+     WHERE id = $1
+     RETURNING id, location_id, status, action`,
+    escalationId,
     nextStatus,
-    body.action,
+    action,
     body.editedReply ?? null,
-    body.note ?? null,
-    adminUser.id,
-  ]);
+    (body.note ?? "").trim() || null,
+    adminUser.id || null,
+  );
 
-  if (updated.rowCount === 0) {
+  if (updated.length === 0) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }
 
-  const row = updated.rows[0];
+  const row = updated[0];
 
-  await writeAdminAuditLog({
-    actorUserId: adminUser.id,
-    actorEmail: adminUser.email ?? null,
-    action: `gbp.escalation.${body.action}`,
-    target: `escalation:${row.id}`,
-    metadata: {
-      escalationId: row.id,
+  await db.execute(
+    `INSERT INTO admin_audit_log (admin_user_id, action, target_type, target_id, payload)
+     VALUES ($1, $2, $3, $4, $5::jsonb)`,
+    adminUser.id || AUDIT_FALLBACK_ACTOR,
+    `gbp.escalation.${action}`,
+    "gbp_escalation",
+    row.id,
+    JSON.stringify({
+      actorEmail: adminUser.email,
       locationId: row.location_id,
       status: row.status,
-      note: body.note ?? null,
-      editedReply: body.action === "edit_and_publish" ? body.editedReply ?? null : null,
-    },
-  });
+      note: (body.note ?? "").trim() || null,
+      editedReply: action === "edit_and_publish" ? body.editedReply ?? null : null,
+    }),
+  );
 
   return NextResponse.json({ ok: true, escalationId: row.id, status: row.status, action: row.action });
 }
