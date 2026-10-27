@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS gbp_locations (
   place_id              text,
   maps_uri              text,
   timezone              text,
+  state                 text,
   review_count          integer NOT NULL DEFAULT 0,
   average_rating        numeric(2,1),
   media_count           integer NOT NULL DEFAULT 0,
@@ -192,13 +193,17 @@ CREATE INDEX IF NOT EXISTS idx_gbp_reports_location ON gbp_reports (location_id,
 
 -- 12. Content checks (claims guard verdicts before any GBP write).
 CREATE TABLE IF NOT EXISTS gbp_content_checks (
-  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  location_id  uuid NOT NULL,
-  subject_type text NOT NULL,
-  subject_id   uuid,
-  verdict      text NOT NULL DEFAULT 'pending',
-  findings     jsonb NOT NULL DEFAULT '[]'::jsonb,
-  created_at   timestamptz NOT NULL DEFAULT now()
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  location_id    uuid NOT NULL,
+  subject_type   text NOT NULL,
+  subject_id     uuid,
+  verdict        text NOT NULL DEFAULT 'pending',
+  findings       jsonb NOT NULL DEFAULT '[]'::jsonb,
+  content_kind   text,
+  content_ref    uuid,
+  stripped_claims jsonb NOT NULL DEFAULT '[]'::jsonb,
+  rewritten_text text,
+  created_at     timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_gbp_content_checks_location ON gbp_content_checks (location_id, created_at DESC);
 
